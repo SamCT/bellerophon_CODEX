@@ -1,0 +1,16 @@
+[project]
+name = "bellerophon"
+version = "0.1.0"
+description = "Filter mapped reads where the mapping spans a junction, retaining the 5-prime read."
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64"]
+
+[dependencies]
+python = ">=3.10"
+pip = ">=24"
+
+[pypi-dependencies]
+bellerophon = { path = ".", editable = true }
+
+[tasks]
+bellerophon = "bellerophon --help"

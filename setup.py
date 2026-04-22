@@ -8,7 +8,7 @@ setuptools.setup(
     author="Dave Bouvier",
     author_email="dave@bx.psu.edu",
     description="Filter reads of a minimum quality that span a junction, retaining the 5´ side of that junction",
-    install_requires=['pysam'],
+    install_requires=['pysam>=0.22'],
     long_description=long_description,
     long_description_content_type="text/markdown",
     test_suite='nose.collector',
@@ -21,5 +21,5 @@ setuptools.setup(
         'License :: OSI Approved :: MIT License',
         "Operating System :: OS Independent",
     ],
-    python_requires='>=3.6',
+    python_requires='>=3.10',
 )
