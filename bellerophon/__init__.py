@@ -1,7 +1,6 @@
 import logging
 import os
 import pysam
-import re
 import sys
 import tempfile
 import time
@@ -18,6 +17,46 @@ handler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 log.addHandler(handler)
+
+MATCH = 0
+SOFT_CLIP = 4
+HARD_CLIP = 5
+
+
+def _classify_read(read):
+    """Classify a read relative to ligation junction orientation."""
+    if read.is_unmapped:
+        return 'unmapped'
+    cigartuples = read.cigartuples
+    if not cigartuples:
+        return 'other'
+
+    first_op = cigartuples[0][0]
+    last_op = cigartuples[-1][0]
+    begins_with_match = first_op == MATCH
+    ends_with_match = last_op == MATCH
+    has_internal_match = any(op == MATCH for op, _ in cigartuples[1:-1])
+    has_terminal_clip = first_op in (SOFT_CLIP, HARD_CLIP) and last_op in (SOFT_CLIP, HARD_CLIP)
+
+    if (read.is_reverse and ends_with_match) or (not read.is_reverse and begins_with_match):
+        return 'five'
+    if (read.is_reverse and begins_with_match) or (not read.is_reverse and ends_with_match):
+        return 'three'
+    if has_terminal_clip and has_internal_match:
+        return 'mid'
+    return 'other'
+
+
+def _write_filtered_group(output_fh, count, five_read, first_read):
+    """Write the best representative read for a query-name group."""
+    if count == 0:
+        return 0
+    if count in (1, 2) and five_read is not None:
+        output_fh.write(five_read)
+        return 1
+    first_read.is_unmapped = 1
+    output_fh.write(first_read)
+    return 1
 
 
 def filter_reads(args):
@@ -36,86 +75,33 @@ def filter_reads(args):
         processed_reads = 0
         written_reads = 0
         previous_read = None
-        all_reads = []
-        unmapped_reads = []
-        five_reads = []
-        three_reads = []
-        mid_reads = []
         counter = 0
-        come_in_here = re.compile(r'^[0-9]*M')
-        dear_boy = re.compile(r'.*M$')
-        have_a_cigar = re.compile(r'^[0-9]*[HS].*M.*[HS]$')  # You're gonna go far, you're gonna fly
+        first_read = None
+        five_read = None
         output_tempfile = tempfile.NamedTemporaryFile(prefix='filtered_', suffix='.bam', delete=False, dir=os.getcwd())
         retval.append(output_tempfile.name)
         output_tempfile.close()
-        output_fh = pysam.AlignmentFile(output_tempfile.name, 'wb', header=handle.header)
+        output_fh = pysam.AlignmentFile(output_tempfile.name, 'wb0', header=handle.header)
         starttime = time.time()
         for read in handle:
             processed_reads += 1
             # If this is 1. Not the first read, and 2. Not the previous read again:
             if previous_read is not None and read.query_name != previous_read:
-                # If we have more than one read in the current batch and one
-                # read is on the 5´ side of a ligation junction.
-                if counter in [1, 2] and len(five_reads) == 1:
-                    # Serve it forth.
-                    output_fh.write(five_reads[0])
-                    written_reads += 1
-                else:
-                    # Get the most recent read, set the unmapped flag, and send it
-                    # to the output file.
-                    new_read = all_reads[0]
-                    new_read.is_unmapped = 1
-                    output_fh.write(new_read)
-                    written_reads += 1
-                # Reset these variables to their original values.
+                written_reads += _write_filtered_group(output_fh, counter, five_read, first_read)
                 counter = 0
-                all_reads = []
-                unmapped_reads = []
-                five_reads = []
-                three_reads = []
-                mid_reads = []
+                first_read = None
+                five_read = None
             counter += 1
-            all_reads.append(read)
+            if first_read is None:
+                first_read = read
             previous_read = read.query_name
-            # Determine whether read is unmapped, or has mapped reads spanning a junction
-            if read.is_unmapped:
-                unmapped_reads.append(read)
-            # If the read is aligned - and has mapped reads at the end, or it is
-            # aligned + and has mapped reads at the beginning, it goes in the 5´
-            # bin and is retained.
-            elif (read.is_reverse and dear_boy.match(read.cigarstring) is not None) or (not read.is_reverse and come_in_here.match(read.cigarstring) is not None):
-                five_reads.append(read)
-            # If the read is aligned + and has mapped reads at the end, or it is
-            # aligned - and has mapped reads at the beginning, it goes in the 3´
-            # bin and is discarded.
-            elif (read.is_reverse and come_in_here.match(read.cigarstring) is not None) or (not read.is_reverse and dear_boy.match(read.cigarstring) is not None):
-                three_reads.append(read)
-            # If it has mapped reads in the middle, put it in that list.
-            elif have_a_cigar.match(read.cigarstring):
-                mid_reads.append(read)
-        # If we have a read.
-        if counter == 1:
-            # And it is on the 5´ side of a ligation junction
-            if len(five_reads) == 1:
-                # We send it to the output
-                output_fh.write(five_reads[0])
-            else:
-                # Otherwise we flag it unmapped and push it out.
-                new_read = all_reads[0]
-                new_read.is_unmapped = 1
-                output_fh.write(new_read)
-                written_reads += 1
-        # Or if we have two reads and one of them is on the 5´ side of a junction.
-        elif counter == 2 and len(five_reads) == 1:
-            # We do.
-            output_fh.write(five_reads[0])
-            written_reads += 1
-        else:
-            # The same kind of thing.
-            new_read = all_reads[0]
-            new_read.is_unmapped = 1
-            output_fh.write(new_read)
-            written_reads += 1
+            if _classify_read(read) == 'five':
+                if five_read is None:
+                    five_read = read
+                else:
+                    five_read = None
+        written_reads += _write_filtered_group(output_fh, counter, five_read, first_read)
+        output_fh.close()
         log.debug('Processed %d reads in %f seconds and output %d.' % (processed_reads, time.time() - starttime, written_reads))
     # Send the filenames of the filtered alignments back to the caller.
     return retval
@@ -140,14 +126,13 @@ def merge_bams(args, filtered_forward, filtered_reverse):
     else:
         new_pg = new_header['PG'] + [OrderedDict(ID=__name__, PN=__name__, VN=__version__, CL=command, DS=__description__)]
     new_header['PG'] = new_pg
-    output_fh = pysam.AlignmentFile(args.output, 'wb', header=pysam.AlignmentHeader.from_dict(new_header))
+    output_fh = pysam.AlignmentFile(args.output, 'wb', header=pysam.AlignmentHeader.from_dict(new_header), threads=args.threads)
     processed_reads = 0
     mismatched_reads = 0
     unmapped_reads = 0
     low_quality_reads = 0
     starttime = time.time()
     for forward_read, reverse_read in zip(forward, reverse):
-        proper_pairs = 0
         # Skip reads that aren't the same, are unmapped, or are less than --quality
         if forward_read.query_name != reverse_read.query_name:
             mismatched_reads += 1
@@ -155,26 +140,19 @@ def merge_bams(args, filtered_forward, filtered_reverse):
         if forward_read.is_unmapped or reverse_read.is_unmapped:
             unmapped_reads += 1
             continue
-        if forward_read.mapping_quality < args.quality or reverse_read.mapping_quality < args.quality:
+        if args.quality > 0 and (forward_read.mapping_quality < args.quality or reverse_read.mapping_quality < args.quality):
             low_quality_reads += 1
             continue
-        if not forward_read.is_unmapped or reverse_read.is_unmapped:
-            proper_pairs = 1
-            # Get the proper distances and lengths, since they may be off now.
-            if forward_read.reference_id == reverse_read.reference_id:
-                distance = abs(forward_read.reference_start - reverse_read.reference_start)
-                if forward_read.reference_start >= reverse_read.reference_start:
-                    forward_length = -1 * distance
-                    reverse_length = distance
-                else:
-                    forward_length = distance
-                    reverse_length = -1 * distance
+        # Get the proper distances and lengths, since they may be off now.
+        if forward_read.reference_id == reverse_read.reference_id:
+            distance = abs(forward_read.reference_start - reverse_read.reference_start)
+            if forward_read.reference_start >= reverse_read.reference_start:
+                forward_length = -distance
+                reverse_length = distance
             else:
-                forward_length = 0
-                reverse_length = 0
-
+                forward_length = distance
+                reverse_length = -distance
         else:
-            proper_pairs = 0
             forward_length = 0
             reverse_length = 0
         # Zero the right flags for the forward and reverse reads.
@@ -190,19 +168,15 @@ def merge_bams(args, filtered_forward, filtered_reverse):
         reverse_read.is_read1 = 0
         forward_read.is_read2 = 0
         # Swap the mapped and reverse attributes between reads.
-        reverse_is_unmapped = reverse_read.is_unmapped
-        forward_is_unmapped = forward_read.is_unmapped
         reverse_is_reverse = reverse_read.is_reverse
         forward_is_reverse = forward_read.is_reverse
-        reverse_read.is_unmapped = forward_is_unmapped
-        forward_read.is_unmapped = reverse_is_unmapped
-        forward_read.mate_is_unmapped = forward_is_unmapped
-        reverse_read.mate_is_unmapped = reverse_is_unmapped
+        forward_read.mate_is_unmapped = 0
+        reverse_read.mate_is_unmapped = 0
         forward_read.mate_is_reverse = reverse_is_reverse
         reverse_read.mate_is_reverse = forward_is_reverse
         # Set them to paired and properly paired.
-        forward_read.is_proper_pair = proper_pairs
-        reverse_read.is_proper_pair = proper_pairs
+        forward_read.is_proper_pair = 1
+        reverse_read.is_proper_pair = 1
         forward_read.is_paired = 1
         reverse_read.is_paired = 1
         # Set the next reference for the reads to each other.
@@ -219,6 +193,9 @@ def merge_bams(args, filtered_forward, filtered_reverse):
     log.info('Successfully merged %d read pairs in %f seconds.' % (processed_reads, time.time() - starttime))
     log.debug('Skipped %d pairs with mismatched read names, %d unmapped reads, and %d with a mapping quality below %d.' %
               (mismatched_reads, unmapped_reads, low_quality_reads, args.quality))
+    output_fh.close()
+    forward.close()
+    reverse.close()
     for filename in [filtered_forward, filtered_reverse]:
         os.unlink(filename)
     return 0
