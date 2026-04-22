@@ -27,3 +27,8 @@ packages = ["bellerophon"]
 
 [tool.setuptools.dynamic]
 version = { attr = "bellerophon.__version__" }
+
+[tool.pytest.ini_options]
+markers = [
+  "performance: dataset-driven performance comparison tests",
+]
