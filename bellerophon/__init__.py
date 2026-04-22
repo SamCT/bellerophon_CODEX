@@ -20,12 +20,22 @@ handler.setFormatter(formatter)
 log.addHandler(handler)
 
 
+def _io_threads(thread_count):
+    """Resolve HTSlib thread count from CLI value and optional compatibility mode."""
+    strategy = os.environ.get('BELLEROPHON_IO_THREADS_STRATEGY', 'capped').strip().lower()
+    requested = max(1, int(thread_count))
+    if strategy == 'legacy':
+        return requested
+    return min(requested, 4)
+
+
 def filter_reads(args):
     log.setLevel(args.log_level)
     retval = []
+    io_threads = _io_threads(args.threads)
     save = pysam.set_verbosity(0)
-    ffh = pysam.AlignmentFile(args.forward, 'r', threads=args.threads)
-    rfh = pysam.AlignmentFile(args.reverse, 'r', threads=args.threads)
+    ffh = pysam.AlignmentFile(args.forward, 'r', threads=io_threads)
+    rfh = pysam.AlignmentFile(args.reverse, 'r', threads=io_threads)
     pysam.set_verbosity(save)
     if ffh.header.references != rfh.header.references or ffh.header.lengths != rfh.header.lengths:
         log.error('The input files do not have the same sequence names or lengths.')
@@ -48,7 +58,7 @@ def filter_reads(args):
         output_tempfile = tempfile.NamedTemporaryFile(prefix='filtered_', suffix='.bam', delete=False, dir=os.getcwd())
         retval.append(output_tempfile.name)
         output_tempfile.close()
-        output_fh = pysam.AlignmentFile(output_tempfile.name, 'wb', header=handle.header)
+        output_fh = pysam.AlignmentFile(output_tempfile.name, 'wb', header=handle.header, threads=io_threads)
         starttime = time.time()
         for read in handle:
             processed_reads += 1
@@ -117,15 +127,19 @@ def filter_reads(args):
             output_fh.write(new_read)
             written_reads += 1
         log.debug('Processed %d reads in %f seconds and output %d.' % (processed_reads, time.time() - starttime, written_reads))
+        output_fh.close()
+    ffh.close()
+    rfh.close()
     # Send the filenames of the filtered alignments back to the caller.
     return retval
 
 
 def merge_bams(args, filtered_forward, filtered_reverse):
     previous = None
+    io_threads = _io_threads(args.threads)
     save = pysam.set_verbosity(0)
-    forward = pysam.AlignmentFile(filtered_forward, 'r', threads=args.threads)
-    reverse = pysam.AlignmentFile(filtered_reverse, 'r', threads=args.threads)
+    forward = pysam.AlignmentFile(filtered_forward, 'r', threads=io_threads)
+    reverse = pysam.AlignmentFile(filtered_reverse, 'r', threads=io_threads)
     pysam.set_verbosity(save)
     new_header = OrderedDict(forward.header)
     if 'PG' in new_header:
@@ -140,7 +154,7 @@ def merge_bams(args, filtered_forward, filtered_reverse):
     else:
         new_pg = new_header['PG'] + [OrderedDict(ID=__name__, PN=__name__, VN=__version__, CL=command, DS=__description__)]
     new_header['PG'] = new_pg
-    output_fh = pysam.AlignmentFile(args.output, 'wb', header=pysam.AlignmentHeader.from_dict(new_header))
+    output_fh = pysam.AlignmentFile(args.output, 'wb', header=pysam.AlignmentHeader.from_dict(new_header), threads=io_threads)
     processed_reads = 0
     mismatched_reads = 0
     unmapped_reads = 0
@@ -219,6 +233,9 @@ def merge_bams(args, filtered_forward, filtered_reverse):
     log.info('Successfully merged %d read pairs in %f seconds.' % (processed_reads, time.time() - starttime))
     log.debug('Skipped %d pairs with mismatched read names, %d unmapped reads, and %d with a mapping quality below %d.' %
               (mismatched_reads, unmapped_reads, low_quality_reads, args.quality))
+    output_fh.close()
+    forward.close()
+    reverse.close()
     for filename in [filtered_forward, filtered_reverse]:
         os.unlink(filename)
     return 0
