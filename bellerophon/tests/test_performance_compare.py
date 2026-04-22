@@ -19,19 +19,6 @@ def _dataset_paths():
     return os.path.abspath(forward), os.path.abspath(reverse)
 
 
-def _env_int(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise AssertionError(f'{name} must be an integer, got: {value}') from exc
-    if parsed < 1:
-        raise AssertionError(f'{name} must be >= 1, got: {parsed}')
-    return parsed
-
-
 def _run_with_time(forward, reverse, output, strategy, threads=32, quality=0):
     if not os.path.exists('/usr/bin/time'):
         pytest.skip('GNU time utility is required for performance comparison tests.')
@@ -104,19 +91,17 @@ def _sha256(path):
 @pytest.mark.performance
 def test_legacy_and_capped_produce_identical_output_and_metrics_report():
     forward, reverse = _dataset_paths()
-    threads = _env_int('BELLEROPHON_PERF_THREADS', 32)
-    quality = _env_int('BELLEROPHON_PERF_QUALITY', 0)
     with tempfile.TemporaryDirectory(prefix='bellerophon_perf_') as tmpdir:
         legacy_output = os.path.join(tmpdir, 'legacy.bam')
         capped_output = os.path.join(tmpdir, 'capped.bam')
 
-        legacy_metrics = _run_with_time(forward, reverse, legacy_output, strategy='legacy', threads=threads, quality=quality)
-        capped_metrics = _run_with_time(forward, reverse, capped_output, strategy='capped', threads=threads, quality=quality)
+        legacy_metrics = _run_with_time(forward, reverse, legacy_output, strategy='legacy')
+        capped_metrics = _run_with_time(forward, reverse, capped_output, strategy='capped')
 
         assert _sha256(legacy_output) == _sha256(capped_output)
 
         report = {
-            'dataset': {'forward': forward, 'reverse': reverse, 'threads': threads, 'quality': quality},
+            'dataset': {'forward': forward, 'reverse': reverse},
             'legacy': legacy_metrics,
             'capped': capped_metrics,
             'delta_seconds': capped_metrics['elapsed_seconds'] - legacy_metrics['elapsed_seconds'],
