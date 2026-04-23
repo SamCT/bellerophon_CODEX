@@ -146,7 +146,7 @@ def merge_bams(args, filtered_forward, filtered_reverse):
         last_pg = new_header['PG'][-1]
         previous = last_pg['ID']
     command = 'bellerophon --forward %s --reverse %s --output %s --quality %s' % \
-        (os.path.split(args.forward)[-1], os.path.split(args.reverse)[-1], os.path.split(args.output)[-1], args.quality)
+        (os.path.split(args.forward)[-1], os.path.split(args.reverse)[-1], '<output>', args.quality)
     new_pg = dict(ID=__name__, PN=__name__, PP=None, VN=__version__, CL=command, DS=__description__)
     if previous is not None:
         new_pg['PP'] = previous

@@ -61,6 +61,23 @@ class TestBellerophon(TestCase):
         os.unlink(self.arguments.output)
         self.assertFalse(os.path.exists(self.arguments.output))
 
+    def test_merge_output_is_stable_across_output_filenames(self):
+        output_filtered_forward, output_filtered_reverse = filter_reads(self.arguments)
+        first_output = tempfile.NamedTemporaryFile(prefix='test_filtered_merged_a_', suffix='.bam', delete=False, dir=os.getcwd())
+        second_output = tempfile.NamedTemporaryFile(prefix='test_filtered_merged_b_', suffix='.bam', delete=False, dir=os.getcwd())
+        first_output.close()
+        second_output.close()
+        self.arguments.output = os.path.abspath(first_output.name)
+        merge_bams(self.arguments, output_filtered_forward, output_filtered_reverse)
+        first_hash, _ = self._hash_files(self.arguments.output, self.arguments.output)
+        output_filtered_forward, output_filtered_reverse = filter_reads(self.arguments)
+        self.arguments.output = os.path.abspath(second_output.name)
+        merge_bams(self.arguments, output_filtered_forward, output_filtered_reverse)
+        second_hash, _ = self._hash_files(self.arguments.output, self.arguments.output)
+        self.assertEqual(first_hash, second_hash)
+        os.unlink(first_output.name)
+        os.unlink(second_output.name)
+
     def _hash_files(self, out_file, cmp_file):
         with open(out_file, 'rb') as fh:
             out_hash = hashlib.sha1(fh.read()).hexdigest()
