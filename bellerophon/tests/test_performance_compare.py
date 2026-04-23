@@ -19,6 +19,16 @@ def _dataset_paths():
     return os.path.abspath(forward), os.path.abspath(reverse)
 
 
+def _scratch_root():
+    scratch = os.environ.get('BELLEROPHON_PERF_SCRATCH_DIR', '/scratch')
+    if not os.path.isdir(scratch):
+        pytest.skip(
+            'Scratch directory does not exist: {scratch}. '
+            'Set BELLEROPHON_PERF_SCRATCH_DIR to a valid directory.'.format(scratch=scratch)
+        )
+    return os.path.abspath(scratch)
+
+
 def _run_with_time(forward, reverse, output, strategy, threads=32, quality=0):
     if not os.path.exists('/usr/bin/time'):
         pytest.skip('GNU time utility is required for performance comparison tests.')
@@ -99,7 +109,8 @@ def _report_path():
 def test_legacy_and_capped_produce_identical_output_and_metrics_report():
     forward, reverse = _dataset_paths()
     report_path = _report_path()
-    with tempfile.TemporaryDirectory(prefix='bellerophon_perf_') as tmpdir:
+    scratch_root = _scratch_root()
+    with tempfile.TemporaryDirectory(prefix='bellerophon_perf_', dir=scratch_root) as tmpdir:
         legacy_output = os.path.join(tmpdir, 'legacy.bam')
         capped_output = os.path.join(tmpdir, 'capped.bam')
 

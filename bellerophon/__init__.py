@@ -20,31 +20,57 @@ handler.setFormatter(formatter)
 log.addHandler(handler)
 
 
+def _mb(path):
+    return os.path.getsize(path) / 1024 / 1024
+
+
 def _io_threads(thread_count):
     """Resolve HTSlib thread count from CLI value and optional compatibility mode."""
-    strategy = os.environ.get('BELLEROPHON_IO_THREADS_STRATEGY', 'capped').strip().lower()
+    strategy = os.environ.get('BELLEROPHON_IO_THREADS_STRATEGY', 'legacy').strip().lower()
     requested = max(1, int(thread_count))
     if strategy == 'legacy':
         return requested
     return min(requested, 4)
 
 
+def _resolve_thread_roles(args):
+    base_threads = _io_threads(getattr(args, 'threads', 1))
+    # Auto-tune roles from a single --threads value.
+    # Filtering and merge phases spend most wall-time in decompression and reads,
+    # while compression threads on temporary/final writers can add contention.
+    read_threads = max(1, base_threads - 1)
+    return {
+        'input': read_threads,
+        'temp_write': 1,
+        'temp_read': read_threads,
+        'output': 1,
+    }
+
+
 def filter_reads(args):
     log.setLevel(args.log_level)
     retval = []
-    io_threads = _io_threads(args.threads)
+    thread_roles = _resolve_thread_roles(args)
+    header_starttime = time.time()
     save = pysam.set_verbosity(0)
-    ffh = pysam.AlignmentFile(args.forward, 'r', threads=io_threads)
-    rfh = pysam.AlignmentFile(args.reverse, 'r', threads=io_threads)
+    ffh = pysam.AlignmentFile(args.forward, 'r', threads=thread_roles['input'])
+    rfh = pysam.AlignmentFile(args.reverse, 'r', threads=thread_roles['input'])
     pysam.set_verbosity(save)
     if ffh.header.references != rfh.header.references or ffh.header.lengths != rfh.header.lengths:
         log.error('The input files do not have the same sequence names or lengths.')
         return 1
+    log.info(
+        'STAGE open_headers seconds=%.6f input_threads=%d',
+        time.time() - header_starttime,
+        thread_roles['input'],
+    )
     for handle in [ffh, rfh]:
         filename = os.path.split(os.path.abspath(handle.filename.decode('utf-8')))[-1]
         log.info('Loading reads from %s...' % filename)
         processed_reads = 0
         written_reads = 0
+        selected_groups = 0
+        placeholder_groups = 0
         previous_read = None
         all_reads = []
         unmapped_reads = []
@@ -58,7 +84,7 @@ def filter_reads(args):
         output_tempfile = tempfile.NamedTemporaryFile(prefix='filtered_', suffix='.bam', delete=False, dir=os.getcwd())
         retval.append(output_tempfile.name)
         output_tempfile.close()
-        output_fh = pysam.AlignmentFile(output_tempfile.name, 'wb', header=handle.header, threads=io_threads)
+        output_fh = pysam.AlignmentFile(output_tempfile.name, 'wb', header=handle.header, threads=thread_roles['temp_write'])
         starttime = time.time()
         for read in handle:
             processed_reads += 1
@@ -70,6 +96,7 @@ def filter_reads(args):
                     # Serve it forth.
                     output_fh.write(five_reads[0])
                     written_reads += 1
+                    selected_groups += 1
                 else:
                     # Get the most recent read, set the unmapped flag, and send it
                     # to the output file.
@@ -77,6 +104,7 @@ def filter_reads(args):
                     new_read.is_unmapped = 1
                     output_fh.write(new_read)
                     written_reads += 1
+                    placeholder_groups += 1
                 # Reset these variables to their original values.
                 counter = 0
                 all_reads = []
@@ -109,25 +137,43 @@ def filter_reads(args):
             if len(five_reads) == 1:
                 # We send it to the output
                 output_fh.write(five_reads[0])
+                selected_groups += 1
             else:
                 # Otherwise we flag it unmapped and push it out.
                 new_read = all_reads[0]
                 new_read.is_unmapped = 1
                 output_fh.write(new_read)
                 written_reads += 1
+                placeholder_groups += 1
         # Or if we have two reads and one of them is on the 5´ side of a junction.
         elif counter == 2 and len(five_reads) == 1:
             # We do.
             output_fh.write(five_reads[0])
             written_reads += 1
+            selected_groups += 1
         else:
             # The same kind of thing.
             new_read = all_reads[0]
             new_read.is_unmapped = 1
             output_fh.write(new_read)
             written_reads += 1
-        log.debug('Processed %d reads in %f seconds and output %d.' % (processed_reads, time.time() - starttime, written_reads))
+            placeholder_groups += 1
         output_fh.close()
+        elapsed = time.time() - starttime
+        temp_size_mb = _mb(output_tempfile.name)
+        log.info(
+            'STAGE filter input=%s processed=%d written=%d selected_groups=%d placeholder_groups=%d seconds=%.6f temp=%s temp_mb=%.3f input_threads=%d temp_write_threads=%d',
+            filename,
+            processed_reads,
+            written_reads,
+            selected_groups,
+            placeholder_groups,
+            elapsed,
+            output_tempfile.name,
+            temp_size_mb,
+            thread_roles['input'],
+            thread_roles['temp_write'],
+        )
     ffh.close()
     rfh.close()
     # Send the filenames of the filtered alignments back to the caller.
@@ -136,10 +182,11 @@ def filter_reads(args):
 
 def merge_bams(args, filtered_forward, filtered_reverse):
     previous = None
-    io_threads = _io_threads(args.threads)
+    thread_roles = _resolve_thread_roles(args)
+    merge_open_starttime = time.time()
     save = pysam.set_verbosity(0)
-    forward = pysam.AlignmentFile(filtered_forward, 'r', threads=io_threads)
-    reverse = pysam.AlignmentFile(filtered_reverse, 'r', threads=io_threads)
+    forward = pysam.AlignmentFile(filtered_forward, 'r', threads=thread_roles['temp_read'])
+    reverse = pysam.AlignmentFile(filtered_reverse, 'r', threads=thread_roles['temp_read'])
     pysam.set_verbosity(save)
     new_header = OrderedDict(forward.header)
     if 'PG' in new_header:
@@ -154,7 +201,13 @@ def merge_bams(args, filtered_forward, filtered_reverse):
     else:
         new_pg = new_header['PG'] + [OrderedDict(ID=__name__, PN=__name__, VN=__version__, CL=command, DS=__description__)]
     new_header['PG'] = new_pg
-    output_fh = pysam.AlignmentFile(args.output, 'wb', header=pysam.AlignmentHeader.from_dict(new_header), threads=io_threads)
+    output_fh = pysam.AlignmentFile(args.output, 'wb', header=pysam.AlignmentHeader.from_dict(new_header), threads=thread_roles['output'])
+    log.info(
+        'STAGE open_merge_inputs seconds=%.6f temp_read_threads=%d output_threads=%d',
+        time.time() - merge_open_starttime,
+        thread_roles['temp_read'],
+        thread_roles['output'],
+    )
     processed_reads = 0
     mismatched_reads = 0
     unmapped_reads = 0
@@ -230,12 +283,25 @@ def merge_bams(args, filtered_forward, filtered_reverse):
         output_fh.write(forward_read)
         output_fh.write(reverse_read)
         processed_reads += 1
-    log.info('Successfully merged %d read pairs in %f seconds.' % (processed_reads, time.time() - starttime))
+    merge_elapsed = time.time() - starttime
+    output_mb = _mb(args.output)
+    log.info(
+        'STAGE merge pairs=%d mismatched=%d unmapped=%d low_mapq=%d seconds=%.6f output=%s output_mb=%.3f',
+        processed_reads,
+        mismatched_reads,
+        unmapped_reads,
+        low_quality_reads,
+        merge_elapsed,
+        args.output,
+        output_mb,
+    )
     log.debug('Skipped %d pairs with mismatched read names, %d unmapped reads, and %d with a mapping quality below %d.' %
               (mismatched_reads, unmapped_reads, low_quality_reads, args.quality))
     output_fh.close()
     forward.close()
     reverse.close()
+    cleanup_start = time.time()
     for filename in [filtered_forward, filtered_reverse]:
         os.unlink(filename)
+    log.info('STAGE cleanup_temp seconds=%.6f deleted=%s,%s', time.time() - cleanup_start, filtered_forward, filtered_reverse)
     return 0
