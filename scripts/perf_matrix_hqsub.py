@@ -23,13 +23,10 @@ def main():
     parser.add_argument('--qualities', default='0,20', help='Comma-separated MAPQ thresholds.')
     parser.add_argument('--strategies', default='legacy,capped', help='Comma-separated IO thread strategies.')
     parser.add_argument('--queue', default='boris')
-    parser.add_argument('--project-cpus', type=int, default=32, help='Fixed value passed to hqsub -P when --project-cpus-mode=fixed.')
-    parser.add_argument('--project-cpus-mode', choices=['fixed', 'thread'], default='thread', help='Use fixed -P value or set -P to the matrix thread count.')
-    parser.add_argument('--resource-prefix', default='perf', help='Prefix for unique hqsub -r values per job.')
-    parser.add_argument('--resource', default=None, help='Deprecated alias for --resource-prefix (kept for backward compatibility).')
+    parser.add_argument('--project-cpus', type=int, default=32, help='Value passed to hqsub -P.')
+    parser.add_argument('--resource', default='p1', help='Value passed to hqsub -r.')
     parser.add_argument('--output-prefix', default='perf_matrix')
     args = parser.parse_args()
-    resource_prefix = args.resource if args.resource else args.resource_prefix
 
     threads = parse_csv_ints(args.threads)
     qualities = parse_csv_ints(args.qualities)
@@ -69,13 +66,11 @@ def main():
             thread_count=thread_count,
             log_txt=log_txt,
         )
-        project_cpus = args.project_cpus if args.project_cpus_mode == 'fixed' else thread_count
-        resource_name = '{prefix}_{run_id}'.format(prefix=resource_prefix, run_id=run_id)
         print(
             "hqsub -q '{queue}' -P {project_cpus} -r '{resource}' \"{cmd}\"".format(
                 queue=args.queue,
-                project_cpus=project_cpus,
-                resource=resource_name,
+                project_cpus=args.project_cpus,
+                resource=args.resource,
                 cmd=cmd,
             )
         )

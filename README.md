@@ -20,7 +20,6 @@ Use this sequence before claiming a speedup:
 5. **Input-shape audit**:
    - `python scripts/input_shape_audit.py --forward FWD.bam --reverse REV.bam --output input_shape.json`
 6. **Cluster matrix submission (one job per setting, `/scratch` outputs):**
-   - `python scripts/perf_matrix_hqsub.py --forward FWD.bam --reverse REV.bam --scratch-dir /scratch --queue boris --project-cpus-mode thread --resource-prefix perf > submit_perf.sh`
+   - `python scripts/perf_matrix_hqsub.py --forward FWD.bam --reverse REV.bam --scratch-dir /scratch --queue boris --project-cpus 32 --resource p1 > submit_perf.sh`
    - `bash submit_perf.sh`
    - `python scripts/perf_matrix_collect.py --matrix-dir /scratch/perf_matrix --output-csv perf_matrix_summary.csv`
-   - Backward compatibility: `--resource` still works as an alias for `--resource-prefix`.
