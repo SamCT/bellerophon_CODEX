@@ -88,22 +88,36 @@ def _sha256(path):
         return hashlib.sha256(fh.read()).hexdigest()
 
 
+def _report_path():
+    destination = os.environ.get('BELLEROPHON_PERF_REPORT_PATH')
+    if destination:
+        return os.path.abspath(destination)
+    return os.path.abspath('performance_report.json')
+
+
 @pytest.mark.performance
 def test_legacy_and_capped_produce_identical_output_and_metrics_report():
     forward, reverse = _dataset_paths()
+    report_path = _report_path()
     with tempfile.TemporaryDirectory(prefix='bellerophon_perf_') as tmpdir:
         legacy_output = os.path.join(tmpdir, 'legacy.bam')
         capped_output = os.path.join(tmpdir, 'capped.bam')
 
         legacy_metrics = _run_with_time(forward, reverse, legacy_output, strategy='legacy')
         capped_metrics = _run_with_time(forward, reverse, capped_output, strategy='capped')
+        legacy_sha = _sha256(legacy_output)
+        capped_sha = _sha256(capped_output)
 
-        assert _sha256(legacy_output) == _sha256(capped_output)
+        assert legacy_sha == capped_sha
 
         report = {
             'dataset': {'forward': forward, 'reverse': reverse},
             'legacy': legacy_metrics,
             'capped': capped_metrics,
+            'sha256': {
+                'legacy': legacy_sha,
+                'capped': capped_sha,
+            },
             'delta_seconds': capped_metrics['elapsed_seconds'] - legacy_metrics['elapsed_seconds'],
             'delta_max_rss_kb': (
                 None
@@ -111,7 +125,6 @@ def test_legacy_and_capped_produce_identical_output_and_metrics_report():
                 else capped_metrics['max_rss_kb'] - legacy_metrics['max_rss_kb']
             ),
         }
-        report_path = os.path.join(tmpdir, 'performance_report.json')
         with open(report_path, 'w', encoding='utf-8') as fh:
             json.dump(report, fh, indent=2, sort_keys=True)
 
