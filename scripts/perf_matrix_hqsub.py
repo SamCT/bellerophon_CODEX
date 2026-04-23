@@ -24,7 +24,18 @@ def main():
     parser.add_argument('--strategies', default='legacy,capped', help='Comma-separated IO thread strategies.')
     parser.add_argument('--queue', default='boris')
     parser.add_argument('--project-cpus', type=int, default=32, help='Value passed to hqsub -P.')
-    parser.add_argument('--resource', default='p1', help='Value passed to hqsub -r.')
+    parser.add_argument(
+        '--project-cpus-mode',
+        choices=('fixed', 'thread'),
+        default='fixed',
+        help='How to set hqsub -P: fixed uses --project-cpus; thread uses current --threads value.',
+    )
+    parser.add_argument('--resource', default='p1', help='Value passed to hqsub -r when --resource-prefix is not set.')
+    parser.add_argument(
+        '--resource-prefix',
+        default=None,
+        help='Optional prefix for per-job resource names; when set, -r becomes <prefix>_<matrix-run-id>.',
+    )
     parser.add_argument('--output-prefix', default='perf_matrix')
     args = parser.parse_args()
 
@@ -66,11 +77,13 @@ def main():
             thread_count=thread_count,
             log_txt=log_txt,
         )
+        project_cpus = thread_count if args.project_cpus_mode == 'thread' else args.project_cpus
+        resource = '{prefix}_{run_id}'.format(prefix=args.resource_prefix, run_id=run_id) if args.resource_prefix else args.resource
         print(
             "hqsub -q '{queue}' -P {project_cpus} -r '{resource}' \"{cmd}\"".format(
                 queue=args.queue,
-                project_cpus=args.project_cpus,
-                resource=args.resource,
+                project_cpus=project_cpus,
+                resource=resource,
                 cmd=cmd,
             )
         )
