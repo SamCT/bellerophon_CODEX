@@ -3,6 +3,13 @@
 # bellerophon
 Filter mapped reads where the mapping spans a junction, retaining the 5-prime read.
 
+## Rust side-by-side implementation
+
+A Rust crate is available at `rust/bellerophon-rs` with a release binary named `bellerophon-rs`.
+
+- Build: `cargo build --release --manifest-path rust/bellerophon-rs/Cargo.toml`
+- Test: `cargo test --manifest-path rust/bellerophon-rs/Cargo.toml`
+
 ## Performance validation workflow
 
 Use this sequence before claiming a speedup:
