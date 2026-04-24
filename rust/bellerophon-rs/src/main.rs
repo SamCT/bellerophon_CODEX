@@ -63,6 +63,18 @@ struct FilterStats {
 }
 
 #[derive(Default)]
+struct PairFilterStats {
+    groups: u64,
+    candidate_groups_fwd: u64,
+    candidate_groups_rev: u64,
+    candidate_pairs: u64,
+    missing_candidate: u64,
+    low_mapq: u64,
+    final_pairs: u64,
+    mismatched: u64,
+}
+
+#[derive(Default)]
 struct MergeStats {
     pairs: u64,
     mismatched: u64,
@@ -75,8 +87,8 @@ fn main() -> Result<()> {
 
     match cli.pipeline {
         Pipeline::LegacyTemp => run_legacy_temp(&cli),
-        Pipeline::PairTemp => bail!("pipeline pair-temp not implemented yet"),
-        Pipeline::Direct => bail!("pipeline direct not implemented yet"),
+        Pipeline::PairTemp => run_pair_temp(&cli),
+        Pipeline::Direct => run_direct(&cli),
     }
 }
 
@@ -148,6 +160,235 @@ fn run_legacy_temp(cli: &Cli) -> Result<()> {
         ),
     );
 
+    Ok(())
+}
+
+fn run_pair_temp(cli: &Cli) -> Result<()> {
+    let thread_roles = resolve_thread_roles(cli.threads);
+    let mut forward_reader = bam::Reader::from_path(&cli.forward)
+        .with_context(|| format!("failed to open forward input {}", cli.forward.display()))?;
+    let mut reverse_reader = bam::Reader::from_path(&cli.reverse)
+        .with_context(|| format!("failed to open reverse input {}", cli.reverse.display()))?;
+    forward_reader
+        .set_threads(thread_roles.input)
+        .context("failed to set forward input threads")?;
+    reverse_reader
+        .set_threads(thread_roles.input)
+        .context("failed to set reverse input threads")?;
+    verify_matching_references(forward_reader.header(), reverse_reader.header())?;
+
+    let forward_temp = make_temp_path(&cli.tmp_dir, "pair_filtered_forward")?;
+    let reverse_temp = make_temp_path(&cli.tmp_dir, "pair_filtered_reverse")?;
+    let header = bam::Header::from_template(forward_reader.header());
+    let mut forward_temp_writer = Writer::from_path(&forward_temp, &header, bam::Format::Bam)
+        .with_context(|| format!("failed to create temp BAM {}", forward_temp.display()))?;
+    let mut reverse_temp_writer = Writer::from_path(&reverse_temp, &header, bam::Format::Bam)
+        .with_context(|| format!("failed to create temp BAM {}", reverse_temp.display()))?;
+    forward_temp_writer
+        .set_threads(thread_roles.temp_write)
+        .context("failed to set forward temp writer threads")?;
+    reverse_temp_writer
+        .set_threads(thread_roles.temp_write)
+        .context("failed to set reverse temp writer threads")?;
+
+    let filter_start = Instant::now();
+    let mut stats = PairFilterStats::default();
+    let mut forward_iter = forward_reader.records();
+    let mut reverse_iter = reverse_reader.records();
+    let mut forward_pending = None;
+    let mut reverse_pending = None;
+
+    loop {
+        let next_forward = next_group(&mut forward_iter, &mut forward_pending)?;
+        let next_reverse = next_group(&mut reverse_iter, &mut reverse_pending)?;
+        match (next_forward, next_reverse) {
+            (Some((f_name, f_group)), Some((r_name, r_group))) => {
+                stats.groups += 1;
+                if f_name != r_name {
+                    stats.mismatched += 1;
+                    bail!(
+                        "pair-temp group name mismatch at group {}: forward={} reverse={}",
+                        stats.groups,
+                        String::from_utf8_lossy(&f_name),
+                        String::from_utf8_lossy(&r_name)
+                    );
+                }
+                let f_candidate = select_group_candidate(&f_group);
+                let r_candidate = select_group_candidate(&r_group);
+                if f_candidate.is_some() {
+                    stats.candidate_groups_fwd += 1;
+                }
+                if r_candidate.is_some() {
+                    stats.candidate_groups_rev += 1;
+                }
+                let (Some(f_candidate), Some(r_candidate)) = (f_candidate, r_candidate) else {
+                    stats.missing_candidate += 1;
+                    continue;
+                };
+                stats.candidate_pairs += 1;
+                if f_candidate.mapq() < cli.quality || r_candidate.mapq() < cli.quality {
+                    stats.low_mapq += 1;
+                    continue;
+                }
+                forward_temp_writer
+                    .write(&f_candidate)
+                    .context("failed to write forward pair-temp record")?;
+                reverse_temp_writer
+                    .write(&r_candidate)
+                    .context("failed to write reverse pair-temp record")?;
+                stats.final_pairs += 1;
+            }
+            (None, None) => break,
+            _ => bail!("pair-temp input BAMs contained a different number of query-name groups"),
+        }
+    }
+    stage_log(
+        cli,
+        format!(
+            "STAGE pair_filter groups={} candidate_pairs={} selected_groups_fwd={} selected_groups_rev={} missing_candidate={} low_mapq={} mismatched={} seconds={:.6} input_threads={}",
+            stats.groups,
+            stats.candidate_pairs,
+            stats.candidate_groups_fwd,
+            stats.candidate_groups_rev,
+            stats.missing_candidate,
+            stats.low_mapq,
+            stats.mismatched,
+            filter_start.elapsed().as_secs_f64(),
+            thread_roles.input
+        ),
+    );
+    drop(forward_temp_writer);
+    drop(reverse_temp_writer);
+    stage_log(
+        cli,
+        format!(
+            "STAGE pair_temp pairs={} seconds={:.6} temp_fwd={} temp_rev={} temp_fwd_mb={:.3} temp_rev_mb={:.3}",
+            stats.final_pairs,
+            filter_start.elapsed().as_secs_f64(),
+            forward_temp.display(),
+            reverse_temp.display(),
+            size_mb(&forward_temp)?,
+            size_mb(&reverse_temp)?,
+        ),
+    );
+
+    merge_pair_temp(cli, &forward_temp, &reverse_temp, thread_roles)?;
+    fs::remove_file(&forward_temp)
+        .with_context(|| format!("failed to delete temp file {}", forward_temp.display()))?;
+    fs::remove_file(&reverse_temp)
+        .with_context(|| format!("failed to delete temp file {}", reverse_temp.display()))?;
+    Ok(())
+}
+
+fn run_direct(cli: &Cli) -> Result<()> {
+    let thread_roles = resolve_thread_roles(cli.threads);
+    let mut forward_reader = bam::Reader::from_path(&cli.forward)
+        .with_context(|| format!("failed to open forward input {}", cli.forward.display()))?;
+    let mut reverse_reader = bam::Reader::from_path(&cli.reverse)
+        .with_context(|| format!("failed to open reverse input {}", cli.reverse.display()))?;
+    forward_reader
+        .set_threads(thread_roles.input)
+        .context("failed to set forward input threads")?;
+    reverse_reader
+        .set_threads(thread_roles.input)
+        .context("failed to set reverse input threads")?;
+    verify_matching_references(forward_reader.header(), reverse_reader.header())?;
+
+    let header = bam::Header::from_template(forward_reader.header());
+    let mut output = Writer::from_path(&cli.output, &header, bam::Format::Bam)
+        .with_context(|| format!("failed to create output {}", cli.output.display()))?;
+    output
+        .set_threads(thread_roles.output)
+        .context("failed to set output threads")?;
+
+    let direct_start = Instant::now();
+    let mut stats = PairFilterStats::default();
+    let mut forward_iter = forward_reader.records();
+    let mut reverse_iter = reverse_reader.records();
+    let mut forward_pending = None;
+    let mut reverse_pending = None;
+
+    loop {
+        let next_forward = next_group(&mut forward_iter, &mut forward_pending)?;
+        let next_reverse = next_group(&mut reverse_iter, &mut reverse_pending)?;
+        match (next_forward, next_reverse) {
+            (Some((f_name, f_group)), Some((r_name, r_group))) => {
+                stats.groups += 1;
+                if f_name != r_name {
+                    stats.mismatched += 1;
+                    bail!(
+                        "direct group name mismatch at group {}: forward={} reverse={}",
+                        stats.groups,
+                        String::from_utf8_lossy(&f_name),
+                        String::from_utf8_lossy(&r_name)
+                    );
+                }
+                let f_candidate = select_group_candidate(&f_group);
+                let r_candidate = select_group_candidate(&r_group);
+                if f_candidate.is_some() {
+                    stats.candidate_groups_fwd += 1;
+                }
+                if r_candidate.is_some() {
+                    stats.candidate_groups_rev += 1;
+                }
+                let (Some(mut f_candidate), Some(mut r_candidate)) = (f_candidate, r_candidate)
+                else {
+                    stats.missing_candidate += 1;
+                    continue;
+                };
+                stats.candidate_pairs += 1;
+                if f_candidate.mapq() < cli.quality || r_candidate.mapq() < cli.quality {
+                    stats.low_mapq += 1;
+                    continue;
+                }
+                let (forward_len, reverse_len) =
+                    signed_template_lengths(&f_candidate, &r_candidate);
+                set_output_flags(&mut f_candidate, true, r_candidate.is_reverse());
+                set_output_flags(&mut r_candidate, false, f_candidate.is_reverse());
+                f_candidate.set_mtid(r_candidate.tid());
+                r_candidate.set_mtid(f_candidate.tid());
+                f_candidate.set_mpos(r_candidate.pos());
+                r_candidate.set_mpos(f_candidate.pos());
+                f_candidate.set_insert_size(forward_len);
+                r_candidate.set_insert_size(reverse_len);
+                output
+                    .write(&f_candidate)
+                    .context("failed to write output forward record")?;
+                output
+                    .write(&r_candidate)
+                    .context("failed to write output reverse record")?;
+                stats.final_pairs += 1;
+            }
+            (None, None) => break,
+            _ => bail!("direct input BAMs contained a different number of query-name groups"),
+        }
+    }
+    drop(output);
+    stage_log(
+        cli,
+        format!(
+            "STAGE pair_filter groups={} candidate_pairs={} selected_groups_fwd={} selected_groups_rev={} missing_candidate={} low_mapq={} mismatched={} seconds={:.6} input_threads={}",
+            stats.groups,
+            stats.candidate_pairs,
+            stats.candidate_groups_fwd,
+            stats.candidate_groups_rev,
+            stats.missing_candidate,
+            stats.low_mapq,
+            stats.mismatched,
+            direct_start.elapsed().as_secs_f64(),
+            thread_roles.input
+        ),
+    );
+    stage_log(
+        cli,
+        format!(
+            "STAGE direct pairs={} seconds={:.6} output={} output_mb={:.3}",
+            stats.final_pairs,
+            direct_start.elapsed().as_secs_f64(),
+            cli.output.display(),
+            size_mb(&cli.output)?
+        ),
+    );
     Ok(())
 }
 
@@ -375,6 +616,161 @@ fn merge_filtered(
     Ok(())
 }
 
+fn merge_pair_temp(
+    cli: &Cli,
+    filtered_forward: &Path,
+    filtered_reverse: &Path,
+    thread_roles: ThreadRoles,
+) -> Result<()> {
+    let mut forward = bam::Reader::from_path(filtered_forward).with_context(|| {
+        format!(
+            "failed to open filtered forward {}",
+            filtered_forward.display()
+        )
+    })?;
+    let mut reverse = bam::Reader::from_path(filtered_reverse).with_context(|| {
+        format!(
+            "failed to open filtered reverse {}",
+            filtered_reverse.display()
+        )
+    })?;
+    forward
+        .set_threads(thread_roles.temp_read)
+        .context("failed to set filtered forward read threads")?;
+    reverse
+        .set_threads(thread_roles.temp_read)
+        .context("failed to set filtered reverse read threads")?;
+
+    let out_header = bam::Header::from_template(forward.header());
+    let mut output = Writer::from_path(&cli.output, &out_header, bam::Format::Bam)
+        .with_context(|| format!("failed to create output {}", cli.output.display()))?;
+    output
+        .set_threads(thread_roles.output)
+        .context("failed to set output threads")?;
+
+    let start = Instant::now();
+    let mut stats = MergeStats::default();
+    let mut forward_iter = forward.records();
+    let mut reverse_iter = reverse.records();
+    loop {
+        let next_forward = forward_iter.next();
+        let next_reverse = reverse_iter.next();
+        match (next_forward, next_reverse) {
+            (Some(Ok(mut f)), Some(Ok(mut r))) => {
+                if f.qname() != r.qname() {
+                    stats.mismatched += 1;
+                    bail!(
+                        "pair-temp merge qname mismatch: forward={} reverse={}",
+                        String::from_utf8_lossy(f.qname()),
+                        String::from_utf8_lossy(r.qname())
+                    );
+                }
+                if f.is_unmapped() || r.is_unmapped() {
+                    stats.unmapped += 1;
+                    continue;
+                }
+                if f.mapq() < cli.quality || r.mapq() < cli.quality {
+                    stats.low_mapq += 1;
+                    continue;
+                }
+                let (forward_len, reverse_len) = signed_template_lengths(&f, &r);
+                set_output_flags(&mut f, true, r.is_reverse());
+                set_output_flags(&mut r, false, f.is_reverse());
+                f.set_mtid(r.tid());
+                r.set_mtid(f.tid());
+                f.set_mpos(r.pos());
+                r.set_mpos(f.pos());
+                f.set_insert_size(forward_len);
+                r.set_insert_size(reverse_len);
+                output
+                    .write(&f)
+                    .context("failed to write output forward record")?;
+                output
+                    .write(&r)
+                    .context("failed to write output reverse record")?;
+                stats.pairs += 1;
+            }
+            (Some(Err(e)), _) | (_, Some(Err(e))) => {
+                return Err(anyhow::Error::from(e).context("failed reading filtered record"));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                bail!("pair-temp merge inputs have different record counts")
+            }
+            (None, None) => break,
+        }
+    }
+    drop(output);
+    stage_log(
+        cli,
+        format!(
+            "STAGE merge pairs={} mismatched={} unmapped={} low_mapq={} seconds={:.6} output={} output_mb={:.3}",
+            stats.pairs,
+            stats.mismatched,
+            stats.unmapped,
+            stats.low_mapq,
+            start.elapsed().as_secs_f64(),
+            cli.output.display(),
+            size_mb(&cli.output)?
+        ),
+    );
+    Ok(())
+}
+
+fn next_group<I>(
+    iter: &mut I,
+    pending: &mut Option<Record>,
+) -> Result<Option<(Vec<u8>, Vec<Record>)>>
+where
+    I: Iterator<Item = std::result::Result<Record, rust_htslib::errors::Error>>,
+{
+    let first = if let Some(record) = pending.take() {
+        record
+    } else {
+        match iter.next() {
+            Some(record) => record.context("failed to read BAM record")?,
+            None => return Ok(None),
+        }
+    };
+    let qname = first.qname().to_vec();
+    let mut group = vec![first];
+    loop {
+        match iter.next() {
+            Some(next) => {
+                let next = next.context("failed to read BAM record")?;
+                if next.qname() == qname.as_slice() {
+                    group.push(next);
+                } else {
+                    *pending = Some(next);
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(Some((qname, group)))
+}
+
+fn select_group_candidate(group_records: &[Record]) -> Option<Record> {
+    if group_records.len() != 1 && group_records.len() != 2 {
+        return None;
+    }
+    let mut candidate: Option<Record> = None;
+    let mut five_prime_count = 0;
+    for record in group_records {
+        if is_five_prime_m_only(record) {
+            five_prime_count += 1;
+            if candidate.is_none() {
+                candidate = Some(record.clone());
+            }
+        }
+    }
+    if five_prime_count == 1 {
+        candidate
+    } else {
+        None
+    }
+}
+
 fn signed_template_lengths(forward: &Record, reverse: &Record) -> (i64, i64) {
     if forward.tid() != reverse.tid() {
         return (0, 0);
@@ -505,6 +901,17 @@ mod tests {
     use super::*;
     use rust_htslib::bam::record::CigarString;
 
+    fn make_record(name: &[u8], reverse: bool, mapq: u8, cigar: CigarString) -> Record {
+        let mut record = Record::new();
+        record.set(name, Some(&cigar), b"A", &[30]);
+        record.set_reverse();
+        if !reverse {
+            clear_flag(&mut record, 0x10);
+        }
+        record.set_mapq(mapq);
+        record
+    }
+
     #[test]
     fn first_cigar_classifier() {
         let cigar = CigarString(vec![Cigar::Match(10), Cigar::SoftClip(3)]);
@@ -553,5 +960,75 @@ mod tests {
         assert!(rec.is_first_in_template());
         assert!(!rec.is_last_in_template());
         assert!(!rec.is_mate_reverse());
+    }
+
+    #[test]
+    fn group_candidate_requires_single_five_prime_read() {
+        let good = make_record(
+            b"q1",
+            false,
+            60,
+            CigarString(vec![Cigar::Match(10), Cigar::SoftClip(3)]),
+        );
+        let bad = make_record(
+            b"q1",
+            false,
+            60,
+            CigarString(vec![Cigar::SoftClip(3), Cigar::Match(10)]),
+        );
+        let one = vec![good.clone()];
+        assert!(select_group_candidate(&one).is_some());
+        let both = vec![good, bad];
+        assert!(select_group_candidate(&both).is_some());
+    }
+
+    #[test]
+    fn group_candidate_rejects_invalid_groups() {
+        let read_a = make_record(
+            b"q1",
+            false,
+            60,
+            CigarString(vec![Cigar::Match(10), Cigar::SoftClip(3)]),
+        );
+        let read_b = make_record(
+            b"q1",
+            false,
+            60,
+            CigarString(vec![Cigar::Match(12), Cigar::SoftClip(1)]),
+        );
+        assert!(select_group_candidate(&[read_a.clone(), read_b]).is_none());
+        assert!(select_group_candidate(&[read_a.clone(), read_a.clone(), read_a]).is_none());
+    }
+
+    #[test]
+    fn next_group_keeps_state_between_calls() {
+        let a1 = make_record(
+            b"a",
+            false,
+            60,
+            CigarString(vec![Cigar::Match(10), Cigar::SoftClip(3)]),
+        );
+        let a2 = make_record(
+            b"a",
+            true,
+            60,
+            CigarString(vec![Cigar::SoftClip(2), Cigar::Match(10)]),
+        );
+        let b1 = make_record(b"b", false, 60, CigarString(vec![Cigar::Match(10)]));
+        let mut iter = vec![Ok(a1), Ok(a2), Ok(b1)].into_iter();
+        let mut pending = None;
+        let g1 = next_group(&mut iter, &mut pending)
+            .expect("group read")
+            .expect("group exists");
+        assert_eq!(g1.0, b"a".to_vec());
+        assert_eq!(g1.1.len(), 2);
+        let g2 = next_group(&mut iter, &mut pending)
+            .expect("group read")
+            .expect("group exists");
+        assert_eq!(g2.0, b"b".to_vec());
+        assert_eq!(g2.1.len(), 1);
+        assert!(next_group(&mut iter, &mut pending)
+            .expect("group read")
+            .is_none());
     }
 }
