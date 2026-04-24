@@ -24,18 +24,33 @@ def read_text(path):
         return fh.read()
 
 
+def elapsed_to_seconds(elapsed):
+    if not elapsed:
+        return ''
+    parts = elapsed.split(':')
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+        return str((int(hours) * 3600) + (int(minutes) * 60) + float(seconds))
+    if len(parts) == 2:
+        minutes, seconds = parts
+        return str((int(minutes) * 60) + float(seconds))
+    return str(float(elapsed))
+
+
 def parse_time_metrics(path):
     text = read_text(path)
     metrics = {}
     for key, pattern in TIME_PATTERNS.items():
         match = re.search(pattern, text)
         metrics[key] = match.group(1) if match else ''
+    metrics['wall_seconds'] = elapsed_to_seconds(metrics['wall_clock'])
     return metrics
 
 
 def parse_stage_metrics(path):
     text = read_text(path)
     row = {}
+
     filter_matches = re.findall(
         r'STAGE filter input=(\S+) processed=(\d+) written=(\d+) selected_groups=(\d+) placeholder_groups=(\d+) seconds=([0-9.]+) temp=(\S+) temp_mb=([0-9.]+)',
         text,
@@ -50,6 +65,30 @@ def parse_stage_metrics(path):
         row['placeholder_groups_fwd'] = filter_matches[0][4]
         row['placeholder_groups_rev'] = filter_matches[1][4]
 
+    pair_filter = re.search(
+        r'STAGE pair_filter groups=(\d+) candidate_pairs=(\d+) selected_groups_fwd=(\d+) selected_groups_rev=(\d+) missing_candidate=(\d+) low_mapq=(\d+) mismatched=(\d+) seconds=([0-9.]+)',
+        text,
+    )
+    if pair_filter:
+        row['pair_groups'] = pair_filter.group(1)
+        row['candidate_pairs'] = pair_filter.group(2)
+        row['selected_groups_fwd'] = pair_filter.group(3)
+        row['selected_groups_rev'] = pair_filter.group(4)
+        row['missing_candidate'] = pair_filter.group(5)
+        row['low_mapq_skips'] = pair_filter.group(6)
+        row['mismatched_skips'] = pair_filter.group(7)
+        row['pair_filter_s'] = pair_filter.group(8)
+
+    pair_temp = re.search(
+        r'STAGE pair_temp pairs=(\d+) seconds=([0-9.]+) temp_fwd=(\S+) temp_rev=(\S+) temp_fwd_mb=([0-9.]+) temp_rev_mb=([0-9.]+)',
+        text,
+    )
+    if pair_temp:
+        row['final_pairs'] = pair_temp.group(1)
+        row['pair_temp_s'] = pair_temp.group(2)
+        row['temp_fwd_mb'] = pair_temp.group(5)
+        row['temp_rev_mb'] = pair_temp.group(6)
+
     merge_match = re.search(
         r'STAGE merge pairs=(\d+) mismatched=(\d+) unmapped=(\d+) low_mapq=(\d+) seconds=([0-9.]+) output=(\S+) output_mb=([0-9.]+)',
         text,
@@ -61,7 +100,29 @@ def parse_stage_metrics(path):
         row['low_mapq_skips'] = merge_match.group(4)
         row['merge_s'] = merge_match.group(5)
         row['output_mb'] = merge_match.group(7)
+
+    direct = re.search(
+        r'STAGE direct pairs=(\d+) seconds=([0-9.]+) output=(\S+) output_mb=([0-9.]+)',
+        text,
+    )
+    if direct:
+        row['final_pairs'] = direct.group(1)
+        row['direct_s'] = direct.group(2)
+        row['output_mb'] = direct.group(4)
+
     return row
+
+
+def infer_pipeline(runner):
+    if runner == 'python':
+        return 'legacy-temp'
+    if runner == 'rust_legacy_temp':
+        return 'legacy-temp'
+    if runner == 'rust_pair_temp':
+        return 'pair-temp'
+    if runner == 'rust_direct':
+        return 'direct'
+    return ''
 
 
 def main():
@@ -75,12 +136,23 @@ def main():
         run_dir = os.path.join(args.matrix_dir, run_id)
         if not os.path.isdir(run_dir):
             continue
-        match = re.match(r's([^_]+)_q([0-9]+)_t([0-9]+)$', run_id)
-        if not match:
-            continue
-        strategy, quality, threads = match.groups()
+
+        # New format: r<runner>_s<strategy>_q<q>_t<t>
+        match = re.match(r'r([^_]+(?:_[^_]+)*)_s([^_]+)_q([0-9]+)_t([0-9]+)$', run_id)
+        if match:
+            runner, strategy, quality, threads = match.groups()
+        else:
+            # Backward compatibility with old format: s<strategy>_q<q>_t<t>
+            old_match = re.match(r's([^_]+)_q([0-9]+)_t([0-9]+)$', run_id)
+            if not old_match:
+                continue
+            strategy, quality, threads = old_match.groups()
+            runner = 'python'
+
         row = {
             'run_id': run_id,
+            'runner': runner,
+            'pipeline': infer_pipeline(runner),
             'strategy': strategy,
             'quality': quality,
             'threads': threads,

@@ -112,7 +112,7 @@ for quality in "${QUALITY_ARRAY[@]}"; do
       --output "$rust_bam" \
       --quality "$quality_trimmed" \
       --threads "$THREADS" \
-      --log-level INFO \
+      --log-level info \
       --pipeline "$pipeline_trimmed" \
       --tmp-dir "$tmp_dir" >"$rust_log" 2>&1
 

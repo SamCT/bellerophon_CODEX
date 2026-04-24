@@ -19,8 +19,8 @@ cargo fmt --manifest-path rust/bellerophon-rs/Cargo.toml
 cargo test --manifest-path rust/bellerophon-rs/Cargo.toml
 ```
 
-## Current pipeline support
+## Pipeline support
 
-- `--pipeline legacy-temp`: implemented.
-- `--pipeline pair-temp`: not implemented yet.
-- `--pipeline direct`: not implemented yet.
+- `--pipeline legacy-temp`: mirrors Python temp-BAM flow.
+- `--pipeline pair-temp`: pair-aware filter, temp BAM only for surviving pairs.
+- `--pipeline direct`: pair-aware filter, writes final BAM directly.

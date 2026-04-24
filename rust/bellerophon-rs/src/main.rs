@@ -205,7 +205,6 @@ fn run_pair_temp(cli: &Cli) -> Result<()> {
             (Some((f_name, f_group)), Some((r_name, r_group))) => {
                 stats.groups += 1;
                 if f_name != r_name {
-                    stats.mismatched += 1;
                     bail!(
                         "pair-temp group name mismatch at group {}: forward={} reverse={}",
                         stats.groups,
@@ -315,7 +314,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
             (Some((f_name, f_group)), Some((r_name, r_group))) => {
                 stats.groups += 1;
                 if f_name != r_name {
-                    stats.mismatched += 1;
                     bail!(
                         "direct group name mismatch at group {}: forward={} reverse={}",
                         stats.groups,
@@ -658,7 +656,6 @@ fn merge_pair_temp(
         match (next_forward, next_reverse) {
             (Some(Ok(mut f)), Some(Ok(mut r))) => {
                 if f.qname() != r.qname() {
-                    stats.mismatched += 1;
                     bail!(
                         "pair-temp merge qname mismatch: forward={} reverse={}",
                         String::from_utf8_lossy(f.qname()),

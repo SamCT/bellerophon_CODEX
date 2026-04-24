@@ -15,6 +15,8 @@ def test_hqsub_matrix_commands_use_unique_resource_names_and_thread_cpu_mode():
             '1,4',
             '--qualities',
             '0',
+            '--runners',
+            'python',
             '--strategies',
             'legacy',
             '--project-cpus-mode',
@@ -30,5 +32,5 @@ def test_hqsub_matrix_commands_use_unique_resource_names_and_thread_cpu_mode():
     assert len(lines) == 2
     assert "-P 1" in lines[0]
     assert "-P 4" in lines[1]
-    assert "-r 'perf_slegacy_q0_t1'" in lines[0]
-    assert "-r 'perf_slegacy_q0_t4'" in lines[1]
+    assert "-r 'perf_rpython_slegacy_q0_t1'" in lines[0]
+    assert "-r 'perf_rpython_slegacy_q0_t4'" in lines[1]
