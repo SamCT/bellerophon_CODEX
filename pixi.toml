@@ -13,6 +13,8 @@ c-compiler = ">=1.11.0,<2"
 cxx-compiler = ">=1.11.0,<2"
 pkg-config = ">=0.29.2,<0.30"
 make = ">=4.4.1,<5"
+libclang = ">=22.1.4,<23"
+pytest = ">=9.0.3,<10"
 
 [pypi-dependencies]
 bellerophon = { path = ".", editable = true }
