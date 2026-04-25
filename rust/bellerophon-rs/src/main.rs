@@ -3,7 +3,7 @@ use clap::{Parser, ValueEnum};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use rust_htslib::bam;
 use rust_htslib::bam::record::{Cigar, Record};
-use rust_htslib::bam::{Read, Writer};
+use rust_htslib::bam::{CompressionLevel, Read, Writer};
 use rust_htslib::tpool::ThreadPool;
 use std::collections::BTreeMap;
 use std::env;
@@ -44,6 +44,10 @@ struct Cli {
     /// Direct mode resolves this to min(--threads, available_parallelism, optional BELLEROPHON_THREADS_CAP).
     #[arg(short = 't', long = "threads", default_value_t = 1)]
     threads: usize,
+    /// BAM compression level for output in direct mode (0-9).
+    /// If omitted, HTSlib default is used.
+    #[arg(long = "compression-level", value_parser = clap::value_parser!(u8).range(0..=9))]
+    compression_level: Option<u8>,
     #[arg(short = 'l', long = "log-level", default_value = "error")]
     log_level: LogLevel,
     #[arg(long = "pipeline", value_enum)]
@@ -103,6 +107,7 @@ struct DirectThreadResolution {
 #[derive(Debug)]
 struct DirectInputBatch {
     sequence: u64,
+    enqueued_at: Instant,
     groups: Vec<(DirectRecordGroup, DirectRecordGroup)>,
 }
 
@@ -120,6 +125,7 @@ struct DirectBatchStats {
 #[derive(Debug)]
 struct DirectOutputBatch {
     sequence: u64,
+    enqueued_at: Instant,
     records: Vec<(Record, Record)>,
     stats: DirectBatchStats,
     process_seconds: f64,
@@ -439,14 +445,22 @@ fn run_direct(cli: &Cli) -> Result<()> {
     output
         .set_thread_pool(&bgzf_pool)
         .context("failed to attach BGZF pool to output")?;
+    if let Some(level) = cli.compression_level {
+        output
+            .set_compression_level(compression_level_from_u8(level))
+            .with_context(|| format!("failed to set output compression level {level}"))?;
+    }
 
     stage_log(
         cli,
         format!(
-            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={}",
+            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} compression_level={}",
             setup_start.elapsed().as_secs_f64(),
             thread_resolution.total_bgzf_workers,
-            thread_resolution.compute_workers
+            thread_resolution.compute_workers,
+            cli.compression_level
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "htslib_default".to_string())
         ),
     );
 
@@ -458,6 +472,9 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let mut received_batches: u64 = 0;
     let mut next_write_sequence: u64 = 0;
     let mut pending_batches: BTreeMap<u64, DirectOutputBatch> = BTreeMap::new();
+    let mut max_pending_batches: usize = 0;
+    let mut max_batch_wait_seconds: f64 = 0.0;
+    let mut hol_warning_emitted = false;
     let (batch_tx, batch_rx) =
         bounded::<Option<DirectInputBatch>>(thread_resolution.compute_workers * 2);
     let (result_tx, result_rx) =
@@ -489,6 +506,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
             &mut stats,
             &mut process_seconds,
             &mut received_batches,
+            &mut max_pending_batches,
+            &mut max_batch_wait_seconds,
+            &mut hol_warning_emitted,
+            cli,
         )?;
         let read_start = Instant::now();
         let next_forward = next_group_records_read(
@@ -547,6 +568,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
             &mut stats,
             &mut process_seconds,
             &mut received_batches,
+            &mut max_pending_batches,
+            &mut max_batch_wait_seconds,
         )?;
     }
     for handle in workers {
@@ -579,6 +602,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
             write_compress_seconds
         ),
     );
+    stage_log(
+        cli,
+        format!(
+            "STAGE direct_hol_metrics max_pending_batches={} max_batch_wait_seconds={:.6}",
+            max_pending_batches, max_batch_wait_seconds
+        ),
+    );
 
     let close_start = Instant::now();
     drop(output);
@@ -601,7 +631,11 @@ fn send_direct_batch(
     groups: Vec<(DirectRecordGroup, DirectRecordGroup)>,
 ) -> Result<()> {
     batch_tx
-        .send(Some(DirectInputBatch { sequence, groups }))
+        .send(Some(DirectInputBatch {
+            sequence,
+            enqueued_at: Instant::now(),
+            groups,
+        }))
         .context("failed to enqueue direct processing batch")
 }
 
@@ -666,6 +700,7 @@ fn process_direct_batch(batch: DirectInputBatch, quality: u8) -> DirectOutputBat
     }
     DirectOutputBatch {
         sequence: batch.sequence,
+        enqueued_at: batch.enqueued_at,
         records: selected,
         stats,
         process_seconds: process_start.elapsed().as_secs_f64(),
@@ -681,12 +716,28 @@ fn drain_completed_batches(
     stats: &mut PairFilterStats,
     process_seconds: &mut f64,
     received_batches: &mut u64,
+    max_pending_batches: &mut usize,
+    max_batch_wait_seconds: &mut f64,
+    hol_warning_emitted: &mut bool,
+    cli: &Cli,
 ) -> Result<()> {
     loop {
         match result_rx.try_recv() {
             Ok(batch) => {
                 *received_batches += 1;
                 pending_batches.insert(batch.sequence, batch);
+                *max_pending_batches = (*max_pending_batches).max(pending_batches.len());
+                if pending_batches.len() >= 8 && !*hol_warning_emitted {
+                    stage_log(
+                        cli,
+                        format!(
+                            "STAGE direct_hol_warning pending_batches={} next_write_sequence={} note=possible_head_of_line_blocking",
+                            pending_batches.len(),
+                            *next_write_sequence
+                        ),
+                    );
+                    *hol_warning_emitted = true;
+                }
                 write_ready_batches(
                     pending_batches,
                     output,
@@ -694,6 +745,7 @@ fn drain_completed_batches(
                     write_compress_seconds,
                     stats,
                     process_seconds,
+                    max_batch_wait_seconds,
                 )?;
             }
             Err(TryRecvError::Empty) => return Ok(()),
@@ -711,12 +763,15 @@ fn receive_and_write_next_batch(
     stats: &mut PairFilterStats,
     process_seconds: &mut f64,
     received_batches: &mut u64,
+    max_pending_batches: &mut usize,
+    max_batch_wait_seconds: &mut f64,
 ) -> Result<()> {
     let batch = result_rx
         .recv()
         .context("direct result channel closed before all batches were processed")?;
     *received_batches += 1;
     pending_batches.insert(batch.sequence, batch);
+    *max_pending_batches = (*max_pending_batches).max(pending_batches.len());
     write_ready_batches(
         pending_batches,
         output,
@@ -724,6 +779,7 @@ fn receive_and_write_next_batch(
         write_compress_seconds,
         stats,
         process_seconds,
+        max_batch_wait_seconds,
     )
 }
 
@@ -734,6 +790,7 @@ fn write_ready_batches(
     write_compress_seconds: &mut f64,
     stats: &mut PairFilterStats,
     process_seconds: &mut f64,
+    max_batch_wait_seconds: &mut f64,
 ) -> Result<()> {
     while let Some(batch) = pending_batches.remove(next_write_sequence) {
         stats.groups += batch.stats.groups;
@@ -744,6 +801,8 @@ fn write_ready_batches(
         stats.low_mapq += batch.stats.low_mapq;
         stats.final_pairs += batch.stats.final_pairs;
         *process_seconds += batch.process_seconds;
+        *max_batch_wait_seconds =
+            (*max_batch_wait_seconds).max(batch.enqueued_at.elapsed().as_secs_f64());
         let write_start = Instant::now();
         for (f_record, r_record) in &batch.records {
             output
@@ -1325,6 +1384,15 @@ fn parse_env_usize(key: &str) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+fn compression_level_from_u8(level: u8) -> CompressionLevel {
+    match level {
+        0 => CompressionLevel::Uncompressed,
+        1 => CompressionLevel::Fastest,
+        9 => CompressionLevel::Maximum,
+        value => CompressionLevel::Level(value as u32),
+    }
+}
+
 fn verify_matching_references(left: &bam::HeaderView, right: &bam::HeaderView) -> Result<()> {
     if left.target_count() != right.target_count() {
         bail!("the input files do not have the same sequence names or lengths");
@@ -1622,5 +1690,25 @@ mod tests {
             resolution.detected_available_parallelism.min(12)
         );
         std::env::remove_var("BELLEROPHON_THREADS_CAP");
+    }
+
+    #[test]
+    fn compression_level_mapping_is_stable() {
+        assert!(matches!(
+            compression_level_from_u8(0),
+            CompressionLevel::Uncompressed
+        ));
+        assert!(matches!(
+            compression_level_from_u8(1),
+            CompressionLevel::Fastest
+        ));
+        assert!(matches!(
+            compression_level_from_u8(9),
+            CompressionLevel::Maximum
+        ));
+        assert!(matches!(
+            compression_level_from_u8(6),
+            CompressionLevel::Level(6)
+        ));
     }
 }
