@@ -280,7 +280,7 @@ fn run_pair_temp(cli: &Cli) -> Result<()> {
 }
 
 fn run_direct(cli: &Cli) -> Result<()> {
-    let thread_roles = resolve_thread_roles(cli.threads);
+    let thread_roles = resolve_direct_thread_roles(cli.threads);
     let mut forward_reader = bam::Reader::from_path(&cli.forward)
         .with_context(|| format!("failed to open forward input {}", cli.forward.display()))?;
     let mut reverse_reader = bam::Reader::from_path(&cli.reverse)
@@ -308,37 +308,50 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let mut reverse_pending = None;
 
     loop {
-        let next_forward = next_group(&mut forward_iter, &mut forward_pending)?;
-        let next_reverse = next_group(&mut reverse_iter, &mut reverse_pending)?;
+        let next_forward = next_group_records(&mut forward_iter, &mut forward_pending)?;
+        let next_reverse = next_group_records(&mut reverse_iter, &mut reverse_pending)?;
         match (next_forward, next_reverse) {
-            (Some((f_name, f_group)), Some((r_name, r_group))) => {
+            (Some(mut f_group), Some(mut r_group)) => {
                 stats.groups += 1;
+                let f_name = f_group
+                    .first()
+                    .map(|record| record.qname())
+                    .unwrap_or_default();
+                let r_name = r_group
+                    .first()
+                    .map(|record| record.qname())
+                    .unwrap_or_default();
                 if f_name != r_name {
                     bail!(
                         "direct group name mismatch at group {}: forward={} reverse={}",
                         stats.groups,
-                        String::from_utf8_lossy(&f_name),
-                        String::from_utf8_lossy(&r_name)
+                        String::from_utf8_lossy(f_name),
+                        String::from_utf8_lossy(r_name)
                     );
                 }
-                let f_candidate = select_group_candidate(&f_group);
-                let r_candidate = select_group_candidate(&r_group);
-                if f_candidate.is_some() {
+                let f_candidate_idx = select_group_candidate_index(&f_group);
+                let r_candidate_idx = select_group_candidate_index(&r_group);
+                if f_candidate_idx.is_some() {
                     stats.candidate_groups_fwd += 1;
                 }
-                if r_candidate.is_some() {
+                if r_candidate_idx.is_some() {
                     stats.candidate_groups_rev += 1;
                 }
-                let (Some(mut f_candidate), Some(mut r_candidate)) = (f_candidate, r_candidate)
+                let (Some(f_candidate_idx), Some(r_candidate_idx)) =
+                    (f_candidate_idx, r_candidate_idx)
                 else {
                     stats.missing_candidate += 1;
                     continue;
                 };
+                let f_mapq = f_group[f_candidate_idx].mapq();
+                let r_mapq = r_group[r_candidate_idx].mapq();
                 stats.candidate_pairs += 1;
-                if f_candidate.mapq() < cli.quality || r_candidate.mapq() < cli.quality {
+                if f_mapq < cli.quality || r_mapq < cli.quality {
                     stats.low_mapq += 1;
                     continue;
                 }
+                let mut f_candidate = f_group.swap_remove(f_candidate_idx);
+                let mut r_candidate = r_group.swap_remove(r_candidate_idx);
                 let (forward_len, reverse_len) =
                     signed_template_lengths(&f_candidate, &r_candidate);
                 set_output_flags(&mut f_candidate, true, r_candidate.is_reverse());
@@ -747,6 +760,38 @@ where
     Ok(Some((qname, group)))
 }
 
+fn next_group_records<I>(iter: &mut I, pending: &mut Option<Record>) -> Result<Option<Vec<Record>>>
+where
+    I: Iterator<Item = std::result::Result<Record, rust_htslib::errors::Error>>,
+{
+    let first = if let Some(record) = pending.take() {
+        record
+    } else {
+        match iter.next() {
+            Some(record) => record.context("failed to read BAM record")?,
+            None => return Ok(None),
+        }
+    };
+    let qname = first.qname().to_vec();
+    let mut group = Vec::with_capacity(2);
+    group.push(first);
+    loop {
+        match iter.next() {
+            Some(next) => {
+                let next = next.context("failed to read BAM record")?;
+                if next.qname() == qname.as_slice() {
+                    group.push(next);
+                } else {
+                    *pending = Some(next);
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(Some(group))
+}
+
 fn select_group_candidate(group_records: &[Record]) -> Option<Record> {
     if group_records.len() != 1 && group_records.len() != 2 {
         return None;
@@ -758,6 +803,27 @@ fn select_group_candidate(group_records: &[Record]) -> Option<Record> {
             five_prime_count += 1;
             if candidate.is_none() {
                 candidate = Some(record.clone());
+            }
+        }
+    }
+    if five_prime_count == 1 {
+        candidate
+    } else {
+        None
+    }
+}
+
+fn select_group_candidate_index(group_records: &[Record]) -> Option<usize> {
+    if group_records.len() != 1 && group_records.len() != 2 {
+        return None;
+    }
+    let mut candidate: Option<usize> = None;
+    let mut five_prime_count = 0;
+    for (idx, record) in group_records.iter().enumerate() {
+        if is_five_prime_m_only(record) {
+            five_prime_count += 1;
+            if candidate.is_none() {
+                candidate = Some(idx);
             }
         }
     }
@@ -820,11 +886,24 @@ fn is_five_prime_m_only(record: &Record) -> bool {
 }
 
 fn first_cigar_op_is_m(cigar: &[Cigar]) -> bool {
-    matches!(cigar.first(), Some(Cigar::Match(_)))
+    matches!(cigar.first(), Some(Cigar::Match(_))) || cigar_has_clipped_middle_m(cigar)
 }
 
 fn last_cigar_op_is_m(cigar: &[Cigar]) -> bool {
-    matches!(cigar.last(), Some(Cigar::Match(_)))
+    matches!(cigar.last(), Some(Cigar::Match(_))) || cigar_has_clipped_middle_m(cigar)
+}
+
+fn cigar_has_clipped_middle_m(cigar: &[Cigar]) -> bool {
+    match (cigar.first(), cigar.last()) {
+        (Some(first), Some(last)) if is_clip_op(first) && is_clip_op(last) => {
+            cigar.iter().any(|op| matches!(op, Cigar::Match(_)))
+        }
+        _ => false,
+    }
+}
+
+fn is_clip_op(op: &Cigar) -> bool {
+    matches!(op, Cigar::SoftClip(_) | Cigar::HardClip(_))
 }
 
 fn resolve_thread_roles(thread_count: usize) -> ThreadRoles {
@@ -843,6 +922,26 @@ fn resolve_thread_roles(thread_count: usize) -> ThreadRoles {
         input: read_threads,
         temp_write: 1,
         temp_read: read_threads,
+        output: 1,
+    }
+}
+
+fn resolve_direct_thread_roles(thread_count: usize) -> ThreadRoles {
+    let requested = thread_count.max(1);
+    // In direct mode we have two BAM readers and one BAM writer active at once.
+    // Oversubscribing BGZF worker threads hurts throughput due to scheduler and
+    // memory-bandwidth contention, so split the budget across readers and cap it.
+    let io_budget = requested.saturating_sub(2).max(1);
+    let max_reader_threads = env::var("BELLEROPHON_DIRECT_MAX_READ_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4);
+    let per_reader_threads = (io_budget / 2).clamp(1, max_reader_threads);
+    ThreadRoles {
+        input: per_reader_threads,
+        temp_write: 1,
+        temp_read: per_reader_threads,
         output: 1,
     }
 }
@@ -915,6 +1014,12 @@ mod tests {
         assert!(first_cigar_op_is_m(&cigar));
         let cigar = CigarString(vec![Cigar::SoftClip(3), Cigar::Match(10)]);
         assert!(!first_cigar_op_is_m(&cigar));
+        let cigar = CigarString(vec![
+            Cigar::SoftClip(3),
+            Cigar::Match(10),
+            Cigar::HardClip(2),
+        ]);
+        assert!(first_cigar_op_is_m(&cigar));
     }
 
     #[test]
@@ -923,6 +1028,88 @@ mod tests {
         assert!(last_cigar_op_is_m(&cigar));
         let cigar = CigarString(vec![Cigar::Match(10), Cigar::SoftClip(3)]);
         assert!(!last_cigar_op_is_m(&cigar));
+        let cigar = CigarString(vec![
+            Cigar::SoftClip(3),
+            Cigar::Match(10),
+            Cigar::HardClip(2),
+        ]);
+        assert!(last_cigar_op_is_m(&cigar));
+    }
+
+    #[test]
+    fn clipped_middle_match_classifier() {
+        let cigar = CigarString(vec![
+            Cigar::SoftClip(10),
+            Cigar::Match(80),
+            Cigar::SoftClip(10),
+        ]);
+        assert!(cigar_has_clipped_middle_m(&cigar));
+        let cigar = CigarString(vec![
+            Cigar::HardClip(10),
+            Cigar::Match(80),
+            Cigar::HardClip(10),
+        ]);
+        assert!(cigar_has_clipped_middle_m(&cigar));
+        let cigar = CigarString(vec![
+            Cigar::SoftClip(10),
+            Cigar::Match(80),
+            Cigar::HardClip(10),
+        ]);
+        assert!(cigar_has_clipped_middle_m(&cigar));
+        let cigar = CigarString(vec![
+            Cigar::SoftClip(10),
+            Cigar::Del(80),
+            Cigar::SoftClip(10),
+        ]);
+        assert!(!cigar_has_clipped_middle_m(&cigar));
+    }
+
+    #[test]
+    fn cigar_regex_semantics_edge_cases() {
+        let cigar = CigarString(vec![Cigar::Match(100)]);
+        assert!(first_cigar_op_is_m(&cigar));
+        assert!(last_cigar_op_is_m(&cigar));
+
+        let cigar = CigarString(vec![Cigar::SoftClip(10), Cigar::Match(90)]);
+        assert!(!first_cigar_op_is_m(&cigar));
+        assert!(last_cigar_op_is_m(&cigar));
+
+        let cigar = CigarString(vec![Cigar::Match(90), Cigar::SoftClip(10)]);
+        assert!(first_cigar_op_is_m(&cigar));
+        assert!(!last_cigar_op_is_m(&cigar));
+
+        let cigar = CigarString(vec![
+            Cigar::SoftClip(10),
+            Cigar::Match(80),
+            Cigar::SoftClip(10),
+        ]);
+        assert!(cigar_has_clipped_middle_m(&cigar));
+        assert!(first_cigar_op_is_m(&cigar));
+        assert!(last_cigar_op_is_m(&cigar));
+
+        let cigar = CigarString(vec![
+            Cigar::HardClip(10),
+            Cigar::Match(80),
+            Cigar::HardClip(10),
+        ]);
+        assert!(cigar_has_clipped_middle_m(&cigar));
+
+        let cigar = CigarString(vec![
+            Cigar::SoftClip(10),
+            Cigar::Match(80),
+            Cigar::HardClip(10),
+        ]);
+        assert!(cigar_has_clipped_middle_m(&cigar));
+
+        let cigar = CigarString(vec![Cigar::Match(80), Cigar::Del(10), Cigar::Match(20)]);
+        assert!(first_cigar_op_is_m(&cigar));
+        assert!(last_cigar_op_is_m(&cigar));
+        assert!(!cigar_has_clipped_middle_m(&cigar));
+
+        let cigar = CigarString(vec![]);
+        assert!(!first_cigar_op_is_m(&cigar));
+        assert!(!last_cigar_op_is_m(&cigar));
+        assert!(!cigar_has_clipped_middle_m(&cigar));
     }
 
     #[test]
@@ -1027,5 +1214,24 @@ mod tests {
         assert!(next_group(&mut iter, &mut pending)
             .expect("group read")
             .is_none());
+    }
+
+    #[test]
+    fn direct_thread_roles_cap_reader_threads() {
+        let one = resolve_direct_thread_roles(1);
+        assert_eq!(one.input, 1);
+        assert_eq!(one.output, 1);
+
+        let eight = resolve_direct_thread_roles(8);
+        assert_eq!(eight.input, 3);
+        assert_eq!(eight.output, 1);
+
+        let sixteen = resolve_direct_thread_roles(16);
+        assert_eq!(sixteen.input, 4);
+        assert_eq!(sixteen.output, 1);
+
+        let thirty_two = resolve_direct_thread_roles(32);
+        assert_eq!(thirty_two.input, 4);
+        assert_eq!(thirty_two.output, 1);
     }
 }
