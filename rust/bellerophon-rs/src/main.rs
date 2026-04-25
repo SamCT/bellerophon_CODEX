@@ -4,9 +4,11 @@ use rust_htslib::bam;
 use rust_htslib::bam::record::{Cigar, Record};
 use rust_htslib::bam::{CompressionLevel, Read, Writer};
 use rust_htslib::tpool::ThreadPool;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 use tempfile::Builder;
@@ -102,6 +104,7 @@ struct DirectThreadResolution {
     compute_workers: usize,
     assigned_threads: usize,
     unused_threads: usize,
+    htslib_pool_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -125,6 +128,7 @@ struct DirectOutputBatch {
     records: Vec<(Record, Record)>,
     stats: DirectBatchStats,
     process_seconds: f64,
+    worker_threads_used: usize,
 }
 
 #[derive(Debug)]
@@ -382,7 +386,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_thread_resolution requested_threads={} detected_available_parallelism={} explicit_user_cap={} resolved_total_threads={} total_bgzf_workers={} per_reader_bgzf_workers={} writer_bgzf_workers={} compute_workers={} assigned_threads={} unused_threads={}",
+            "STAGE direct_thread_resolution requested_threads={} detected_available_parallelism={} explicit_user_cap={} resolved_total_threads={} total_bgzf_workers={} per_reader_bgzf_workers={} writer_bgzf_workers={} compute_workers={} assigned_threads={} unused_threads={} htslib_pool_enabled={}",
             thread_resolution.requested_threads,
             thread_resolution.detected_available_parallelism,
             thread_resolution
@@ -395,7 +399,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
             thread_resolution.writer_bgzf_workers,
             thread_resolution.compute_workers,
             thread_resolution.assigned_threads,
-            thread_resolution.unused_threads
+            thread_resolution.unused_threads,
+            thread_resolution.htslib_pool_enabled
         ),
     );
     if thread_resolution.requested_threads > thread_resolution.detected_available_parallelism {
@@ -437,22 +442,29 @@ fn run_direct(cli: &Cli) -> Result<()> {
         .with_context(|| format!("failed to open forward input {}", cli.forward.display()))?;
     let mut reverse_reader = bam::Reader::from_path(&cli.reverse)
         .with_context(|| format!("failed to open reverse input {}", cli.reverse.display()))?;
-    let bgzf_pool = ThreadPool::new(thread_resolution.total_bgzf_workers as u32)
-        .context("failed to create shared BGZF thread pool")?;
-    forward_reader
-        .set_thread_pool(&bgzf_pool)
-        .context("failed to attach BGZF pool to forward input")?;
-    reverse_reader
-        .set_thread_pool(&bgzf_pool)
-        .context("failed to attach BGZF pool to reverse input")?;
+    let bgzf_pool = if thread_resolution.htslib_pool_enabled {
+        let pool = ThreadPool::new(thread_resolution.total_bgzf_workers as u32)
+            .context("failed to create shared BGZF thread pool")?;
+        forward_reader
+            .set_thread_pool(&pool)
+            .context("failed to attach BGZF pool to forward input")?;
+        reverse_reader
+            .set_thread_pool(&pool)
+            .context("failed to attach BGZF pool to reverse input")?;
+        Some(pool)
+    } else {
+        None
+    };
     verify_matching_references(forward_reader.header(), reverse_reader.header())?;
 
     let header = bam::Header::from_template(forward_reader.header());
     let mut output = Writer::from_path(&cli.output, &header, bam::Format::Bam)
         .with_context(|| format!("failed to create output {}", cli.output.display()))?;
-    output
-        .set_thread_pool(&bgzf_pool)
-        .context("failed to attach BGZF pool to output")?;
+    if let Some(pool) = bgzf_pool.as_ref() {
+        output
+            .set_thread_pool(pool)
+            .context("failed to attach BGZF pool to output")?;
+    }
     if let Some(level) = cli.compression_level {
         output
             .set_compression_level(compression_level_from_u8(level))
@@ -462,13 +474,14 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} compression_level={}",
+            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} compression_level={} htslib_pool_enabled={}",
             setup_start.elapsed().as_secs_f64(),
             thread_resolution.total_bgzf_workers,
             thread_resolution.compute_workers,
             cli.compression_level
                 .map(|v| v.to_string())
-                .unwrap_or_else(|| "htslib_default".to_string())
+                .unwrap_or_else(|| "htslib_default".to_string()),
+            thread_resolution.htslib_pool_enabled
         ),
     );
 
@@ -486,6 +499,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let mut batches_processed: u64 = 0;
     let mut total_batch_size: u64 = 0;
     let mut max_batch_size: usize = 0;
+    let mut max_compute_workers_used: usize = 0;
 
     let mut forward_pending = None;
     let mut reverse_pending = None;
@@ -526,6 +540,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     flush_direct_batch(
                         &mut active_batch,
                         cli.quality,
+                        thread_resolution.compute_workers,
                         &mut output,
                         &mut stats,
                         &mut process_seconds,
@@ -534,6 +549,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                         &mut total_batch_size,
                         &mut max_batch_size,
                         &mut batch_enqueue_wait_seconds,
+                        &mut max_compute_workers_used,
                     )?;
                 }
             }
@@ -542,6 +558,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     flush_direct_batch(
                         &mut active_batch,
                         cli.quality,
+                        thread_resolution.compute_workers,
                         &mut output,
                         &mut stats,
                         &mut process_seconds,
@@ -550,6 +567,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                         &mut total_batch_size,
                         &mut max_batch_size,
                         &mut batch_enqueue_wait_seconds,
+                        &mut max_compute_workers_used,
                     )?;
                 }
                 break;
@@ -610,14 +628,21 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} max_queue_depth={} producer_blocked_seconds={:.6} writer_idle_seconds={:.6} batches_processed={} average_batch_size={:.3} max_batch_size={}",
+            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} max_queue_depth={} producer_blocked_seconds={:.6} writer_idle_seconds={:.6} batches_processed={} average_batch_size={:.3} max_batch_size={} compute_workers_assigned={} compute_workers_observed={} compute_worker_utilization_ratio={:.3}",
             writer_wait_for_sequence_seconds,
             max_queue_depth,
             producer_blocked_seconds,
             writer_idle_seconds,
             batches_processed,
             average_batch_size,
-            max_batch_size
+            max_batch_size,
+            thread_resolution.compute_workers,
+            max_compute_workers_used,
+            if thread_resolution.compute_workers > 0 {
+                max_compute_workers_used as f64 / thread_resolution.compute_workers as f64
+            } else {
+                0.0
+            }
         ),
     );
 
@@ -644,6 +669,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
 fn flush_direct_batch(
     active_batch: &mut Vec<(DirectRecordGroup, DirectRecordGroup)>,
     quality: u8,
+    compute_workers: usize,
     output: &mut Writer,
     stats: &mut PairFilterStats,
     process_seconds: &mut f64,
@@ -652,6 +678,7 @@ fn flush_direct_batch(
     total_batch_size: &mut u64,
     max_batch_size: &mut usize,
     batch_enqueue_wait_seconds: &mut f64,
+    max_compute_workers_used: &mut usize,
 ) -> Result<()> {
     if active_batch.is_empty() {
         return Ok(());
@@ -662,7 +689,7 @@ fn flush_direct_batch(
         groups: std::mem::replace(active_batch, Vec::with_capacity(1024)),
     };
     *batch_enqueue_wait_seconds += enqueue_start.elapsed().as_secs_f64();
-    let output_batch = process_direct_batch(batch, quality);
+    let output_batch = process_direct_batch(batch, quality, compute_workers);
     *process_seconds += output_batch.process_seconds;
     stats.groups += output_batch.stats.groups;
     stats.candidate_groups_fwd += output_batch.stats.candidate_groups_fwd;
@@ -684,54 +711,109 @@ fn flush_direct_batch(
     *batches_processed += 1;
     *total_batch_size += batch_size as u64;
     *max_batch_size = (*max_batch_size).max(batch_size);
+    *max_compute_workers_used = (*max_compute_workers_used).max(output_batch.worker_threads_used);
     Ok(())
 }
 
-fn process_direct_batch(batch: DirectInputBatch, quality: u8) -> DirectOutputBatch {
+fn process_direct_batch(
+    batch: DirectInputBatch,
+    quality: u8,
+    compute_workers: usize,
+) -> DirectOutputBatch {
     let process_start = Instant::now();
+    let observed_workers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let worker_count = compute_workers.max(1).min(batch.groups.len().max(1));
+    let mut partitions: Vec<Vec<(DirectRecordGroup, DirectRecordGroup)>> =
+        (0..worker_count).map(|_| Vec::new()).collect();
+    for (idx, group_pair) in batch.groups.into_iter().enumerate() {
+        partitions[idx % worker_count].push(group_pair);
+    }
+    let results = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for partition in partitions {
+            let workers = Arc::clone(&observed_workers);
+            let handle = scope.spawn(move || {
+                if let Ok(mut seen) = workers.lock() {
+                    seen.insert(format!("{:?}", thread::current().id()));
+                }
+                let mut out = Vec::with_capacity(partition.len());
+                for (f_group, r_group) in partition {
+                    out.push(process_group_pair(f_group, r_group, quality));
+                }
+                out
+            });
+            handles.push(handle);
+        }
+        let mut merged = Vec::new();
+        for handle in handles {
+            if let Ok(mut part) = handle.join() {
+                merged.append(&mut part);
+            }
+        }
+        merged
+    });
     let mut stats = DirectBatchStats::default();
-    let mut selected = Vec::with_capacity(batch.groups.len());
-    for (f_group, r_group) in batch.groups {
-        stats.groups += 1;
-        let f_candidate_slot = select_group_candidate_slot(&f_group);
-        let r_candidate_slot = select_group_candidate_slot(&r_group);
-        if f_candidate_slot.is_some() {
-            stats.candidate_groups_fwd += 1;
+    let mut selected = Vec::with_capacity(results.len());
+    for (item_stats, pair) in results {
+        stats.groups += item_stats.groups;
+        stats.candidate_groups_fwd += item_stats.candidate_groups_fwd;
+        stats.candidate_groups_rev += item_stats.candidate_groups_rev;
+        stats.candidate_pairs += item_stats.candidate_pairs;
+        stats.missing_candidate += item_stats.missing_candidate;
+        stats.low_mapq += item_stats.low_mapq;
+        stats.final_pairs += item_stats.final_pairs;
+        if let Some(pair) = pair {
+            selected.push(pair);
         }
-        if r_candidate_slot.is_some() {
-            stats.candidate_groups_rev += 1;
-        }
-        let (Some(f_candidate_slot), Some(r_candidate_slot)) = (f_candidate_slot, r_candidate_slot)
-        else {
-            stats.missing_candidate += 1;
-            continue;
-        };
-        stats.candidate_pairs += 1;
-        if f_group.mapq_at(f_candidate_slot) < quality
-            || r_group.mapq_at(r_candidate_slot) < quality
-        {
-            stats.low_mapq += 1;
-            continue;
-        }
-        let mut f_candidate = f_group.take_candidate(f_candidate_slot);
-        let mut r_candidate = r_group.take_candidate(r_candidate_slot);
-        let (forward_len, reverse_len) = signed_template_lengths(&f_candidate, &r_candidate);
-        set_output_flags(&mut f_candidate, true, r_candidate.is_reverse());
-        set_output_flags(&mut r_candidate, false, f_candidate.is_reverse());
-        f_candidate.set_mtid(r_candidate.tid());
-        r_candidate.set_mtid(f_candidate.tid());
-        f_candidate.set_mpos(r_candidate.pos());
-        r_candidate.set_mpos(f_candidate.pos());
-        f_candidate.set_insert_size(forward_len);
-        r_candidate.set_insert_size(reverse_len);
-        selected.push((f_candidate, r_candidate));
-        stats.final_pairs += 1;
     }
     DirectOutputBatch {
         records: selected,
         stats,
         process_seconds: process_start.elapsed().as_secs_f64(),
+        worker_threads_used: observed_workers.lock().map(|v| v.len()).unwrap_or(0),
     }
+}
+
+fn process_group_pair(
+    f_group: DirectRecordGroup,
+    r_group: DirectRecordGroup,
+    quality: u8,
+) -> (DirectBatchStats, Option<(Record, Record)>) {
+    let mut stats = DirectBatchStats {
+        groups: 1,
+        ..Default::default()
+    };
+    let f_candidate_slot = select_group_candidate_slot(&f_group);
+    let r_candidate_slot = select_group_candidate_slot(&r_group);
+    if f_candidate_slot.is_some() {
+        stats.candidate_groups_fwd += 1;
+    }
+    if r_candidate_slot.is_some() {
+        stats.candidate_groups_rev += 1;
+    }
+    let (Some(f_candidate_slot), Some(r_candidate_slot)) = (f_candidate_slot, r_candidate_slot)
+    else {
+        stats.missing_candidate += 1;
+        return (stats, None);
+    };
+    stats.candidate_pairs += 1;
+    if f_group.mapq_at(f_candidate_slot) < quality || r_group.mapq_at(r_candidate_slot) < quality {
+        stats.low_mapq += 1;
+        return (stats, None);
+    }
+    let mut f_candidate = f_group.take_candidate(f_candidate_slot);
+    let mut r_candidate = r_group.take_candidate(r_candidate_slot);
+    let (forward_len, reverse_len) = signed_template_lengths(&f_candidate, &r_candidate);
+    set_output_flags(&mut f_candidate, true, r_candidate.is_reverse());
+    set_output_flags(&mut r_candidate, false, f_candidate.is_reverse());
+    f_candidate.set_mtid(r_candidate.tid());
+    r_candidate.set_mtid(f_candidate.tid());
+    f_candidate.set_mpos(r_candidate.pos());
+    r_candidate.set_mpos(f_candidate.pos());
+    f_candidate.set_insert_size(forward_len);
+    r_candidate.set_insert_size(reverse_len);
+    stats.final_pairs += 1;
+    (stats, Some((f_candidate, r_candidate)))
 }
 
 fn filter_one_side(
@@ -1276,23 +1358,30 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
         .min(detected_available_parallelism)
         .max(1);
 
-    let compute_workers = if resolved_total_threads >= 64 {
-        6
-    } else if resolved_total_threads >= 24 {
-        4
-    } else if resolved_total_threads >= 12 {
-        3
-    } else if resolved_total_threads >= 4 {
-        2
+    let htslib_pool_enabled = !parse_env_bool("BELLEROPHON_DIRECT_DISABLE_HTSLIB_TPOOL");
+    let bgzf_cap = parse_env_usize("BELLEROPHON_DIRECT_BGZF_THREADS_CAP").unwrap_or(8);
+    let total_bgzf_workers = if htslib_pool_enabled {
+        let default_bgzf = (resolved_total_threads / 4).max(1);
+        default_bgzf
+            .min(bgzf_cap)
+            .min(resolved_total_threads.saturating_sub(1).max(1))
     } else {
-        1
+        0
     };
-    let total_bgzf_workers = resolved_total_threads
-        .saturating_sub(compute_workers)
+    let compute_workers = resolved_total_threads
+        .saturating_sub(total_bgzf_workers)
         .max(1);
-    let writer_bgzf_workers = (total_bgzf_workers / 3).max(1);
+    let writer_bgzf_workers = if total_bgzf_workers > 0 {
+        (total_bgzf_workers / 3).max(1)
+    } else {
+        0
+    };
     let remaining_reader_workers = total_bgzf_workers.saturating_sub(writer_bgzf_workers);
-    let per_reader_bgzf_workers = (remaining_reader_workers / 2).max(1);
+    let per_reader_bgzf_workers = if total_bgzf_workers > 0 {
+        (remaining_reader_workers / 2).max(1)
+    } else {
+        0
+    };
     let assigned_threads = total_bgzf_workers + compute_workers;
     let unused_threads = resolved_total_threads.saturating_sub(assigned_threads);
 
@@ -1307,7 +1396,20 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
         compute_workers,
         assigned_threads,
         unused_threads,
+        htslib_pool_enabled,
     }
+}
+
+fn parse_env_bool(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn parse_env_usize(key: &str) -> Option<usize> {
@@ -1379,6 +1481,12 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn make_record(name: &[u8], reverse: bool, mapq: u8, cigar: CigarString) -> Record {
         let mut record = Record::new();
@@ -1601,7 +1709,7 @@ mod tests {
 
     #[test]
     fn direct_thread_roles_use_requested_threads_without_hidden_32_cap() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_guard();
         std::env::remove_var("BELLEROPHON_THREADS_CAP");
         let resolution = resolve_direct_thread_roles(128);
         assert_eq!(
@@ -1619,7 +1727,7 @@ mod tests {
 
     #[test]
     fn direct_thread_roles_only_back_off_for_available_parallelism() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_guard();
         std::env::remove_var("BELLEROPHON_THREADS_CAP");
         let requested = 64usize;
         let resolution = resolve_direct_thread_roles(requested);
@@ -1636,7 +1744,7 @@ mod tests {
 
     #[test]
     fn direct_thread_roles_respect_explicit_user_cap() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_guard();
         std::env::set_var("BELLEROPHON_THREADS_CAP", "12");
         let resolution = resolve_direct_thread_roles(64);
         assert_eq!(resolution.explicit_user_cap, Some(12));
@@ -1645,6 +1753,37 @@ mod tests {
             12usize.min(resolution.detected_available_parallelism)
         );
         std::env::remove_var("BELLEROPHON_THREADS_CAP");
+    }
+
+    #[test]
+    fn direct_thread_roles_can_disable_htslib_pool() {
+        let _guard = env_guard();
+        std::env::set_var("BELLEROPHON_DIRECT_DISABLE_HTSLIB_TPOOL", "1");
+        std::env::remove_var("BELLEROPHON_THREADS_CAP");
+        let resolution = resolve_direct_thread_roles(16);
+        assert!(!resolution.htslib_pool_enabled);
+        assert_eq!(resolution.total_bgzf_workers, 0);
+        assert_eq!(
+            resolution.compute_workers,
+            resolution.resolved_total_threads
+        );
+        std::env::remove_var("BELLEROPHON_DIRECT_DISABLE_HTSLIB_TPOOL");
+    }
+
+    #[test]
+    fn direct_thread_roles_limit_bgzf_workers_by_cap() {
+        let _guard = env_guard();
+        std::env::set_var("BELLEROPHON_DIRECT_BGZF_THREADS_CAP", "2");
+        std::env::remove_var("BELLEROPHON_THREADS_CAP");
+        let resolution = resolve_direct_thread_roles(32);
+        assert!(resolution.htslib_pool_enabled);
+        assert!(resolution.total_bgzf_workers <= 2);
+        assert!(resolution.total_bgzf_workers >= 1);
+        assert_eq!(
+            resolution.compute_workers + resolution.total_bgzf_workers,
+            resolution.resolved_total_threads
+        );
+        std::env::remove_var("BELLEROPHON_DIRECT_BGZF_THREADS_CAP");
     }
 
     #[test]
