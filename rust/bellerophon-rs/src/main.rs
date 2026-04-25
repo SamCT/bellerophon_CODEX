@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use rust_htslib::bam;
 use rust_htslib::bam::record::{Cigar, Record};
 use rust_htslib::bam::{CompressionLevel, Read, Writer};
-use rust_htslib::tpool::ThreadPool;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -129,6 +129,13 @@ struct DirectOutputBatch {
     stats: DirectBatchStats,
     process_seconds: f64,
     worker_threads_used: usize,
+}
+
+#[derive(Debug)]
+struct DirectReadStep {
+    group: Option<DirectRecordGroup>,
+    bam_read_decode_seconds: f64,
+    qname_group_seconds: f64,
 }
 
 #[derive(Debug)]
@@ -438,33 +445,31 @@ fn run_direct(cli: &Cli) -> Result<()> {
         );
     }
 
-    let mut forward_reader = bam::Reader::from_path(&cli.forward)
+    let forward_reader = bam::Reader::from_path(&cli.forward)
         .with_context(|| format!("failed to open forward input {}", cli.forward.display()))?;
-    let mut reverse_reader = bam::Reader::from_path(&cli.reverse)
+    let reverse_reader = bam::Reader::from_path(&cli.reverse)
         .with_context(|| format!("failed to open reverse input {}", cli.reverse.display()))?;
-    let bgzf_pool = if thread_resolution.htslib_pool_enabled {
-        let pool = ThreadPool::new(thread_resolution.total_bgzf_workers as u32)
-            .context("failed to create shared BGZF thread pool")?;
-        forward_reader
-            .set_thread_pool(&pool)
-            .context("failed to attach BGZF pool to forward input")?;
-        reverse_reader
-            .set_thread_pool(&pool)
-            .context("failed to attach BGZF pool to reverse input")?;
-        Some(pool)
-    } else {
-        None
-    };
     verify_matching_references(forward_reader.header(), reverse_reader.header())?;
-
     let header = bam::Header::from_template(forward_reader.header());
+    drop(forward_reader);
+    drop(reverse_reader);
+
+    let reader_bgzf_threads = if thread_resolution.htslib_pool_enabled {
+        thread_resolution.per_reader_bgzf_workers.max(1)
+    } else {
+        1
+    };
+    let writer_bgzf_threads = if thread_resolution.htslib_pool_enabled {
+        thread_resolution.writer_bgzf_workers.max(1)
+    } else {
+        1
+    };
+
     let mut output = Writer::from_path(&cli.output, &header, bam::Format::Bam)
         .with_context(|| format!("failed to create output {}", cli.output.display()))?;
-    if let Some(pool) = bgzf_pool.as_ref() {
-        output
-            .set_thread_pool(pool)
-            .context("failed to attach BGZF pool to output")?;
-    }
+    output
+        .set_threads(writer_bgzf_threads)
+        .context("failed to set direct output BGZF threads")?;
     if let Some(level) = cli.compression_level {
         output
             .set_compression_level(compression_level_from_u8(level))
@@ -474,9 +479,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} compression_level={} htslib_pool_enabled={}",
+            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} per_reader_bgzf_workers={} writer_bgzf_workers={} compute_workers={} compression_level={} htslib_pool_enabled={}",
             setup_start.elapsed().as_secs_f64(),
             thread_resolution.total_bgzf_workers,
+            reader_bgzf_threads,
+            writer_bgzf_threads,
             thread_resolution.compute_workers,
             cli.compression_level
                 .map(|v| v.to_string())
@@ -501,31 +508,26 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let mut max_batch_size: usize = 0;
     let mut max_compute_workers_used: usize = 0;
 
-    let mut forward_pending = None;
-    let mut reverse_pending = None;
-    let mut forward_record = Record::new();
-    let mut reverse_record = Record::new();
     let mut active_batch: Vec<(DirectRecordGroup, DirectRecordGroup)> = Vec::with_capacity(1024);
+    let (forward_tx, forward_rx) = bounded::<Result<DirectReadStep>>(2048);
+    let (reverse_tx, reverse_rx) = bounded::<Result<DirectReadStep>>(2048);
+    let forward_path = cli.forward.clone();
+    let reverse_path = cli.reverse.clone();
+    let forward_handle = thread::spawn(move || {
+        stream_groups_from_path(&forward_path, reader_bgzf_threads, forward_tx)
+    });
+    let reverse_handle = thread::spawn(move || {
+        stream_groups_from_path(&reverse_path, reader_bgzf_threads, reverse_tx)
+    });
 
     loop {
-        let group_read_start = Instant::now();
-        let read_decode_before = read_decode_seconds;
-        let next_forward = next_group_records_read(
-            &mut forward_reader,
-            &mut forward_pending,
-            &mut forward_record,
-            &mut read_decode_seconds,
-        )?;
-        let next_reverse = next_group_records_read(
-            &mut reverse_reader,
-            &mut reverse_pending,
-            &mut reverse_record,
-            &mut read_decode_seconds,
-        )?;
-        qname_group_seconds +=
-            group_read_start.elapsed().as_secs_f64() - (read_decode_seconds - read_decode_before);
+        let next_forward = recv_read_step(&forward_rx, "forward")?;
+        let next_reverse = recv_read_step(&reverse_rx, "reverse")?;
+        read_decode_seconds +=
+            next_forward.bam_read_decode_seconds + next_reverse.bam_read_decode_seconds;
+        qname_group_seconds += next_forward.qname_group_seconds + next_reverse.qname_group_seconds;
         let match_start = Instant::now();
-        match (next_forward, next_reverse) {
+        match (next_forward.group, next_reverse.group) {
             (Some(f_group), Some(r_group)) => {
                 if f_group.qname() != r_group.qname() {
                     bail!(
@@ -576,6 +578,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
         }
         pair_match_assembly_seconds += match_start.elapsed().as_secs_f64();
     }
+    forward_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("forward reader thread panicked"))??;
+    reverse_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("reverse reader thread panicked"))??;
+
     let read_match_seconds =
         read_decode_seconds + qname_group_seconds + pair_match_assembly_seconds;
     if writer_drain_seconds > process_seconds && stats.final_pairs > 0 {
@@ -1214,6 +1223,54 @@ fn next_group_records_read(
         }
     }
     Ok(Some(group))
+}
+
+fn recv_read_step(rx: &Receiver<Result<DirectReadStep>>, label: &str) -> Result<DirectReadStep> {
+    match rx.recv() {
+        Ok(step) => step,
+        Err(_) => bail!("direct {label} group stream terminated unexpectedly"),
+    }
+}
+
+fn stream_groups_from_path(
+    path: &Path,
+    reader_bgzf_threads: usize,
+    tx: Sender<Result<DirectReadStep>>,
+) -> Result<()> {
+    let mut reader = bam::Reader::from_path(path)
+        .with_context(|| format!("failed to open direct input {}", path.display()))?;
+    reader.set_threads(reader_bgzf_threads).with_context(|| {
+        format!(
+            "failed to set direct input BGZF threads for {}",
+            path.display()
+        )
+    })?;
+    let mut pending = None;
+    let mut scratch = Record::new();
+    loop {
+        let group_start = Instant::now();
+        let mut decode_seconds = 0.0;
+        let group =
+            next_group_records_read(&mut reader, &mut pending, &mut scratch, &mut decode_seconds)
+                .with_context(|| {
+                format!(
+                    "failed reading grouped direct records from {}",
+                    path.display()
+                )
+            })?;
+        let is_done = group.is_none();
+        let qname_group_seconds = (group_start.elapsed().as_secs_f64() - decode_seconds).max(0.0);
+        tx.send(Ok(DirectReadStep {
+            group,
+            bam_read_decode_seconds: decode_seconds,
+            qname_group_seconds,
+        }))
+        .context("failed to send direct read group to coordinator")?;
+        if is_done {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn select_group_candidate(group_records: &[Record]) -> Option<Record> {
