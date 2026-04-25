@@ -79,6 +79,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossbeam-channel",
  "noodles-bam",
  "noodles-bgzf 0.37.0",
  "noodles-sam",

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+crossbeam-channel = "0.5"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 noodles-bam = "0.79"
