@@ -25,10 +25,18 @@ cargo test --manifest-path rust/bellerophon-rs/Cargo.toml
 - `--pipeline pair-temp`: pair-aware filter, temp BAM only for surviving pairs.
 - `--pipeline direct`: pair-aware filter, writes final BAM directly.
 
-## Thread-tuning environment variables
+## Direct mode thread model
 
-- `BELLEROPHON_DIRECT_MAX_READ_THREADS` (optional): caps per-reader BGZF workers in `--pipeline direct`.
-- `BELLEROPHON_DIRECT_MAX_WRITE_THREADS` (optional): caps output writer BGZF workers in `--pipeline direct`.
+- `--threads` is the total thread budget for direct mode.
+- Resolved total threads are `min(--threads, available_parallelism())`, unless an explicit cap is set with `BELLEROPHON_THREADS_CAP`.
+- There is no hidden default cap (for example no implicit 32-thread ceiling).
+- Direct mode uses a single shared HTSlib BGZF thread pool (`set_thread_pool`) attached to both readers and the writer.
+- The resolved total is split adaptively into:
+  - total BGZF workers
+  - per-reader BGZF workers (target share)
+  - writer BGZF workers (target share)
+  - compute workers for batch processing
 
-If unset, direct mode scales worker counts with `--threads` instead of using fixed default caps.
-The default split is adaptive: small thread counts keep 1-2 writer workers, and larger counts reserve ~20% for writer/compression and split the rest across the two readers.
+### Thread-related environment variables
+
+- `BELLEROPHON_THREADS_CAP` (optional): explicit upper bound for resolved total threads.
