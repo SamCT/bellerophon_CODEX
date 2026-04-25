@@ -929,20 +929,33 @@ fn resolve_thread_roles(thread_count: usize) -> ThreadRoles {
 fn resolve_direct_thread_roles(thread_count: usize) -> ThreadRoles {
     let requested = thread_count.max(1);
     // In direct mode we have two BAM readers and one BAM writer active at once.
-    // Oversubscribing BGZF worker threads hurts throughput due to scheduler and
-    // memory-bandwidth contention, so split the budget across readers and cap it.
-    let io_budget = requested.saturating_sub(2).max(1);
+    // Adaptive split:
+    // - keep at least one writer worker
+    // - bias remaining workers toward the two readers
+    // - increase writer workers gradually as requested threads increase
     let max_reader_threads = env::var("BELLEROPHON_DIRECT_MAX_READ_THREADS")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4);
-    let per_reader_threads = (io_budget / 2).clamp(1, max_reader_threads);
+        .unwrap_or(requested);
+    let max_writer_threads = env::var("BELLEROPHON_DIRECT_MAX_WRITE_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(requested);
+    let writer_target = match requested {
+        1..=4 => 1,
+        5..=8 => 2,
+        _ => (requested / 5).max(2),
+    };
+    let writer_threads = writer_target.clamp(1, max_writer_threads);
+    let per_reader_threads =
+        ((requested.saturating_sub(writer_threads)) / 2).clamp(1, max_reader_threads);
     ThreadRoles {
         input: per_reader_threads,
         temp_write: 1,
         temp_read: per_reader_threads,
-        output: 1,
+        output: writer_threads,
     }
 }
 
@@ -1217,21 +1230,30 @@ mod tests {
     }
 
     #[test]
-    fn direct_thread_roles_cap_reader_threads() {
+    fn direct_thread_roles_scale_without_default_caps() {
         let one = resolve_direct_thread_roles(1);
         assert_eq!(one.input, 1);
         assert_eq!(one.output, 1);
 
         let eight = resolve_direct_thread_roles(8);
         assert_eq!(eight.input, 3);
-        assert_eq!(eight.output, 1);
+        assert_eq!(eight.output, 2);
 
         let sixteen = resolve_direct_thread_roles(16);
-        assert_eq!(sixteen.input, 4);
-        assert_eq!(sixteen.output, 1);
+        assert_eq!(sixteen.input, 6);
+        assert_eq!(sixteen.output, 3);
 
         let thirty_two = resolve_direct_thread_roles(32);
-        assert_eq!(thirty_two.input, 4);
-        assert_eq!(thirty_two.output, 1);
+        assert_eq!(thirty_two.input, 13);
+        assert_eq!(thirty_two.output, 6);
+    }
+
+    #[test]
+    fn direct_thread_roles_respect_writer_cap() {
+        std::env::set_var("BELLEROPHON_DIRECT_MAX_WRITE_THREADS", "1");
+        let roles = resolve_direct_thread_roles(12);
+        assert_eq!(roles.input, 5);
+        assert_eq!(roles.output, 1);
+        std::env::remove_var("BELLEROPHON_DIRECT_MAX_WRITE_THREADS");
     }
 }
