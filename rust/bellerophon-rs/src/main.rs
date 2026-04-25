@@ -6,6 +6,7 @@ use rust_htslib::bam::{Read, Writer};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::Instant;
 use tempfile::Builder;
 
@@ -80,6 +81,71 @@ struct MergeStats {
     mismatched: u64,
     unmapped: u64,
     low_mapq: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DirectThreadResolution {
+    roles: ThreadRoles,
+    requested_threads: usize,
+    detected_available_parallelism: usize,
+    env_total_override: Option<usize>,
+    env_total_cap: Option<usize>,
+    resolved_total_threads: usize,
+    env_reader_override: Option<usize>,
+    env_writer_override: Option<usize>,
+}
+
+#[derive(Debug)]
+struct DirectRecordGroup {
+    first: Record,
+    second: Option<Record>,
+    extra_count: usize,
+}
+
+#[derive(Clone, Copy)]
+enum CandidateSlot {
+    First,
+    Second,
+}
+
+impl DirectRecordGroup {
+    fn new(first: Record) -> Self {
+        Self {
+            first,
+            second: None,
+            extra_count: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        1 + usize::from(self.second.is_some()) + self.extra_count
+    }
+
+    fn qname(&self) -> &[u8] {
+        self.first.qname()
+    }
+
+    fn push_same_qname(&mut self, record: Record) {
+        if self.second.is_none() {
+            self.second = Some(record);
+        } else {
+            self.extra_count += 1;
+        }
+    }
+
+    fn mapq_at(&self, slot: CandidateSlot) -> u8 {
+        match slot {
+            CandidateSlot::First => self.first.mapq(),
+            CandidateSlot::Second => self.second.as_ref().map(|r| r.mapq()).unwrap_or_default(),
+        }
+    }
+
+    fn take_candidate(self, slot: CandidateSlot) -> Record {
+        match slot {
+            CandidateSlot::First => self.first,
+            CandidateSlot::Second => self.second.expect("candidate slot must exist"),
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -280,7 +346,25 @@ fn run_pair_temp(cli: &Cli) -> Result<()> {
 }
 
 fn run_direct(cli: &Cli) -> Result<()> {
-    let thread_roles = resolve_direct_thread_roles(cli.threads);
+    let setup_start = Instant::now();
+    let thread_resolution = resolve_direct_thread_roles(cli.threads);
+    let thread_roles = thread_resolution.roles;
+    stage_log(
+        cli,
+        format!(
+            "STAGE direct_thread_resolution requested_threads={} detected_available_parallelism={} env_total_override={} env_total_cap={} env_reader_override={} env_writer_override={} resolved_total_threads={} reader_threads={} writer_threads={}",
+            thread_resolution.requested_threads,
+            thread_resolution.detected_available_parallelism,
+            thread_resolution.env_total_override.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
+            thread_resolution.env_total_cap.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
+            thread_resolution.env_reader_override.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
+            thread_resolution.env_writer_override.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
+            thread_resolution.resolved_total_threads,
+            thread_roles.input,
+            thread_roles.output
+        ),
+    );
+
     let mut forward_reader = bam::Reader::from_path(&cli.forward)
         .with_context(|| format!("failed to open forward input {}", cli.forward.display()))?;
     let mut reverse_reader = bam::Reader::from_path(&cli.reverse)
@@ -300,58 +384,65 @@ fn run_direct(cli: &Cli) -> Result<()> {
         .set_threads(thread_roles.output)
         .context("failed to set output threads")?;
 
-    let direct_start = Instant::now();
+    stage_log(
+        cli,
+        format!(
+            "STAGE direct_open_setup seconds={:.6} input_threads={} output_threads={}",
+            setup_start.elapsed().as_secs_f64(),
+            thread_roles.input,
+            thread_roles.output
+        ),
+    );
+
     let mut stats = PairFilterStats::default();
+    let mut read_select_seconds = 0.0f64;
+    let mut write_compress_seconds = 0.0f64;
     let mut forward_iter = forward_reader.records();
     let mut reverse_iter = reverse_reader.records();
     let mut forward_pending = None;
     let mut reverse_pending = None;
 
     loop {
+        let read_start = Instant::now();
         let next_forward = next_group_records(&mut forward_iter, &mut forward_pending)?;
         let next_reverse = next_group_records(&mut reverse_iter, &mut reverse_pending)?;
         match (next_forward, next_reverse) {
-            (Some(mut f_group), Some(mut r_group)) => {
+            (Some(f_group), Some(r_group)) => {
                 stats.groups += 1;
-                let f_name = f_group
-                    .first()
-                    .map(|record| record.qname())
-                    .unwrap_or_default();
-                let r_name = r_group
-                    .first()
-                    .map(|record| record.qname())
-                    .unwrap_or_default();
-                if f_name != r_name {
+                if f_group.qname() != r_group.qname() {
                     bail!(
                         "direct group name mismatch at group {}: forward={} reverse={}",
                         stats.groups,
-                        String::from_utf8_lossy(f_name),
-                        String::from_utf8_lossy(r_name)
+                        String::from_utf8_lossy(f_group.qname()),
+                        String::from_utf8_lossy(r_group.qname())
                     );
                 }
-                let f_candidate_idx = select_group_candidate_index(&f_group);
-                let r_candidate_idx = select_group_candidate_index(&r_group);
-                if f_candidate_idx.is_some() {
+                let f_candidate_slot = select_group_candidate_slot(&f_group);
+                let r_candidate_slot = select_group_candidate_slot(&r_group);
+                if f_candidate_slot.is_some() {
                     stats.candidate_groups_fwd += 1;
                 }
-                if r_candidate_idx.is_some() {
+                if r_candidate_slot.is_some() {
                     stats.candidate_groups_rev += 1;
                 }
-                let (Some(f_candidate_idx), Some(r_candidate_idx)) =
-                    (f_candidate_idx, r_candidate_idx)
+                let (Some(f_candidate_slot), Some(r_candidate_slot)) =
+                    (f_candidate_slot, r_candidate_slot)
                 else {
                     stats.missing_candidate += 1;
+                    read_select_seconds += read_start.elapsed().as_secs_f64();
                     continue;
                 };
-                let f_mapq = f_group[f_candidate_idx].mapq();
-                let r_mapq = r_group[r_candidate_idx].mapq();
+                let f_mapq = f_group.mapq_at(f_candidate_slot);
+                let r_mapq = r_group.mapq_at(r_candidate_slot);
                 stats.candidate_pairs += 1;
                 if f_mapq < cli.quality || r_mapq < cli.quality {
                     stats.low_mapq += 1;
+                    read_select_seconds += read_start.elapsed().as_secs_f64();
                     continue;
                 }
-                let mut f_candidate = f_group.swap_remove(f_candidate_idx);
-                let mut r_candidate = r_group.swap_remove(r_candidate_idx);
+                read_select_seconds += read_start.elapsed().as_secs_f64();
+                let mut f_candidate = f_group.take_candidate(f_candidate_slot);
+                let mut r_candidate = r_group.take_candidate(r_candidate_slot);
                 let (forward_len, reverse_len) =
                     signed_template_lengths(&f_candidate, &r_candidate);
                 set_output_flags(&mut f_candidate, true, r_candidate.is_reverse());
@@ -362,23 +453,27 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 r_candidate.set_mpos(f_candidate.pos());
                 f_candidate.set_insert_size(forward_len);
                 r_candidate.set_insert_size(reverse_len);
+                let write_start = Instant::now();
                 output
                     .write(&f_candidate)
                     .context("failed to write output forward record")?;
                 output
                     .write(&r_candidate)
                     .context("failed to write output reverse record")?;
+                write_compress_seconds += write_start.elapsed().as_secs_f64();
                 stats.final_pairs += 1;
             }
-            (None, None) => break,
+            (None, None) => {
+                read_select_seconds += read_start.elapsed().as_secs_f64();
+                break;
+            }
             _ => bail!("direct input BAMs contained a different number of query-name groups"),
         }
     }
-    drop(output);
     stage_log(
         cli,
         format!(
-            "STAGE pair_filter groups={} candidate_pairs={} selected_groups_fwd={} selected_groups_rev={} missing_candidate={} low_mapq={} mismatched={} seconds={:.6} input_threads={}",
+            "STAGE direct_process groups={} candidate_pairs={} selected_groups_fwd={} selected_groups_rev={} missing_candidate={} low_mapq={} mismatched={} read_select_seconds={:.6} write_compress_seconds={:.6}",
             stats.groups,
             stats.candidate_pairs,
             stats.candidate_groups_fwd,
@@ -386,16 +481,19 @@ fn run_direct(cli: &Cli) -> Result<()> {
             stats.missing_candidate,
             stats.low_mapq,
             stats.mismatched,
-            direct_start.elapsed().as_secs_f64(),
-            thread_roles.input
+            read_select_seconds,
+            write_compress_seconds
         ),
     );
+
+    let close_start = Instant::now();
+    drop(output);
     stage_log(
         cli,
         format!(
-            "STAGE direct pairs={} seconds={:.6} output={} output_mb={:.3}",
+            "STAGE direct_close_finalize pairs={} close_finalize_seconds={:.6} output={} output_mb={:.3}",
             stats.final_pairs,
-            direct_start.elapsed().as_secs_f64(),
+            close_start.elapsed().as_secs_f64(),
             cli.output.display(),
             size_mb(&cli.output)?
         ),
@@ -760,7 +858,10 @@ where
     Ok(Some((qname, group)))
 }
 
-fn next_group_records<I>(iter: &mut I, pending: &mut Option<Record>) -> Result<Option<Vec<Record>>>
+fn next_group_records<I>(
+    iter: &mut I,
+    pending: &mut Option<Record>,
+) -> Result<Option<DirectRecordGroup>>
 where
     I: Iterator<Item = std::result::Result<Record, rust_htslib::errors::Error>>,
 {
@@ -772,15 +873,13 @@ where
             None => return Ok(None),
         }
     };
-    let qname = first.qname().to_vec();
-    let mut group = Vec::with_capacity(2);
-    group.push(first);
+    let mut group = DirectRecordGroup::new(first);
     loop {
         match iter.next() {
             Some(next) => {
                 let next = next.context("failed to read BAM record")?;
-                if next.qname() == qname.as_slice() {
-                    group.push(next);
+                if next.qname() == group.qname() {
+                    group.push_same_qname(next);
                 } else {
                     *pending = Some(next);
                     break;
@@ -813,24 +912,20 @@ fn select_group_candidate(group_records: &[Record]) -> Option<Record> {
     }
 }
 
-fn select_group_candidate_index(group_records: &[Record]) -> Option<usize> {
+fn select_group_candidate_slot(group_records: &DirectRecordGroup) -> Option<CandidateSlot> {
     if group_records.len() != 1 && group_records.len() != 2 {
         return None;
     }
-    let mut candidate: Option<usize> = None;
-    let mut five_prime_count = 0;
-    for (idx, record) in group_records.iter().enumerate() {
-        if is_five_prime_m_only(record) {
-            five_prime_count += 1;
-            if candidate.is_none() {
-                candidate = Some(idx);
-            }
-        }
-    }
-    if five_prime_count == 1 {
-        candidate
-    } else {
-        None
+    let first_ok = is_five_prime_m_only(&group_records.first);
+    let second_ok = group_records
+        .second
+        .as_ref()
+        .map(is_five_prime_m_only)
+        .unwrap_or(false);
+    match (first_ok, second_ok) {
+        (true, false) => Some(CandidateSlot::First),
+        (false, true) => Some(CandidateSlot::Second),
+        _ => None,
     }
 }
 
@@ -926,37 +1021,64 @@ fn resolve_thread_roles(thread_count: usize) -> ThreadRoles {
     }
 }
 
-fn resolve_direct_thread_roles(thread_count: usize) -> ThreadRoles {
+fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
+    const DIRECT_DEFAULT_MAX_THREADS: usize = 32;
     let requested = thread_count.max(1);
-    // In direct mode we have two BAM readers and one BAM writer active at once.
-    // Adaptive split:
-    // - keep at least one writer worker
-    // - bias remaining workers toward the two readers
-    // - increase writer workers gradually as requested threads increase
-    let max_reader_threads = env::var("BELLEROPHON_DIRECT_MAX_READ_THREADS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(requested);
-    let max_writer_threads = env::var("BELLEROPHON_DIRECT_MAX_WRITE_THREADS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(requested);
-    let writer_target = match requested {
-        1..=4 => 1,
-        5..=8 => 2,
-        _ => (requested / 5).max(2),
-    };
-    let writer_threads = writer_target.clamp(1, max_writer_threads);
-    let per_reader_threads =
-        ((requested.saturating_sub(writer_threads)) / 2).clamp(1, max_reader_threads);
-    ThreadRoles {
-        input: per_reader_threads,
-        temp_write: 1,
-        temp_read: per_reader_threads,
-        output: writer_threads,
+    let detected_available_parallelism = thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1);
+    let env_total_override = parse_env_usize("BELLEROPHON_DIRECT_THREADS");
+    let env_total_cap = parse_env_usize("BELLEROPHON_DIRECT_MAX_THREADS");
+    let env_reader_override = parse_env_usize("BELLEROPHON_DIRECT_READER_THREADS");
+    let env_writer_override = parse_env_usize("BELLEROPHON_DIRECT_WRITER_THREADS");
+    let max_reader_threads = parse_env_usize("BELLEROPHON_DIRECT_MAX_READ_THREADS");
+    let max_writer_threads = parse_env_usize("BELLEROPHON_DIRECT_MAX_WRITE_THREADS");
+
+    // Keep defaults deterministic and bounded for reproducible runs:
+    // 1) start from CLI requested threads
+    // 2) optionally override via env
+    // 3) cap by machine parallelism and by default/global cap (default: 32)
+    let requested_or_override = env_total_override.unwrap_or(requested);
+    let capped_by_machine = requested_or_override.min(detected_available_parallelism);
+    let total_cap = env_total_cap.unwrap_or(DIRECT_DEFAULT_MAX_THREADS);
+    let resolved_total_threads = capped_by_machine.min(total_cap).max(1);
+
+    let writer_heuristic = (resolved_total_threads / 8).max(1);
+    let mut writer_threads = env_writer_override.unwrap_or(writer_heuristic);
+    if let Some(max_writer) = max_writer_threads {
+        writer_threads = writer_threads.min(max_writer);
     }
+    writer_threads = writer_threads.max(1);
+
+    let reader_heuristic = ((resolved_total_threads.saturating_sub(writer_threads)) / 2).max(1);
+    let mut reader_threads = env_reader_override.unwrap_or(reader_heuristic);
+    if let Some(max_reader) = max_reader_threads {
+        reader_threads = reader_threads.min(max_reader);
+    }
+    reader_threads = reader_threads.max(1);
+
+    DirectThreadResolution {
+        roles: ThreadRoles {
+            input: reader_threads,
+            temp_write: 1,
+            temp_read: reader_threads,
+            output: writer_threads,
+        },
+        requested_threads: requested,
+        detected_available_parallelism,
+        env_total_override,
+        env_total_cap: Some(total_cap),
+        resolved_total_threads,
+        env_reader_override,
+        env_writer_override,
+    }
+}
+
+fn parse_env_usize(key: &str) -> Option<usize> {
+    env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn verify_matching_references(left: &bam::HeaderView, right: &bam::HeaderView) -> Result<()> {
@@ -1230,30 +1352,44 @@ mod tests {
     }
 
     #[test]
-    fn direct_thread_roles_scale_without_default_caps() {
-        let one = resolve_direct_thread_roles(1);
-        assert_eq!(one.input, 1);
-        assert_eq!(one.output, 1);
+    fn direct_thread_roles_default_policy_is_bounded() {
+        std::env::set_var("BELLEROPHON_DIRECT_MAX_THREADS", "32");
+        std::env::remove_var("BELLEROPHON_DIRECT_THREADS");
+        std::env::remove_var("BELLEROPHON_DIRECT_READER_THREADS");
+        std::env::remove_var("BELLEROPHON_DIRECT_WRITER_THREADS");
+        std::env::remove_var("BELLEROPHON_DIRECT_MAX_READ_THREADS");
+        std::env::remove_var("BELLEROPHON_DIRECT_MAX_WRITE_THREADS");
 
-        let eight = resolve_direct_thread_roles(8);
-        assert_eq!(eight.input, 3);
-        assert_eq!(eight.output, 2);
+        let resolution = resolve_direct_thread_roles(128);
+        assert!(resolution.resolved_total_threads <= 32);
+        assert!(resolution.roles.input >= 1);
+        assert!(resolution.roles.output >= 1);
 
-        let sixteen = resolve_direct_thread_roles(16);
-        assert_eq!(sixteen.input, 6);
-        assert_eq!(sixteen.output, 3);
-
-        let thirty_two = resolve_direct_thread_roles(32);
-        assert_eq!(thirty_two.input, 13);
-        assert_eq!(thirty_two.output, 6);
+        std::env::remove_var("BELLEROPHON_DIRECT_MAX_THREADS");
     }
 
     #[test]
-    fn direct_thread_roles_respect_writer_cap() {
+    fn direct_thread_roles_respect_writer_override_and_caps() {
+        std::env::set_var("BELLEROPHON_DIRECT_THREADS", "64");
+        std::env::set_var("BELLEROPHON_DIRECT_MAX_THREADS", "32");
+        std::env::set_var("BELLEROPHON_DIRECT_WRITER_THREADS", "8");
         std::env::set_var("BELLEROPHON_DIRECT_MAX_WRITE_THREADS", "1");
-        let roles = resolve_direct_thread_roles(12);
-        assert_eq!(roles.input, 5);
-        assert_eq!(roles.output, 1);
+        std::env::set_var("BELLEROPHON_DIRECT_READER_THREADS", "9");
+        std::env::set_var("BELLEROPHON_DIRECT_MAX_READ_THREADS", "4");
+        let resolution = resolve_direct_thread_roles(12);
+        assert_eq!(resolution.roles.input, 4);
+        assert_eq!(resolution.roles.output, 1);
+        assert_eq!(resolution.env_total_override, Some(64));
+        assert!(resolution.resolved_total_threads <= 32);
+        assert_eq!(
+            resolution.resolved_total_threads,
+            resolution.detected_available_parallelism.min(32)
+        );
+        std::env::remove_var("BELLEROPHON_DIRECT_THREADS");
+        std::env::remove_var("BELLEROPHON_DIRECT_MAX_THREADS");
+        std::env::remove_var("BELLEROPHON_DIRECT_WRITER_THREADS");
         std::env::remove_var("BELLEROPHON_DIRECT_MAX_WRITE_THREADS");
+        std::env::remove_var("BELLEROPHON_DIRECT_READER_THREADS");
+        std::env::remove_var("BELLEROPHON_DIRECT_MAX_READ_THREADS");
     }
 }
