@@ -888,6 +888,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let writer_bytes_per_second_estimate = Arc::clone(&writer_bytes_per_second_estimate);
     let writer_last_progress_micros = Arc::clone(&writer_last_progress_micros);
     let writer_next_expected_batch_id = Arc::clone(&ordered_writer_next_expected_batch_id);
+    let writer_next_expected_batch_id_for_thread = Arc::clone(&writer_next_expected_batch_id);
     let output_path_for_writer = cli.output.clone();
     let writer_handle = thread::spawn(move || {
         direct_writer_thread(
@@ -898,7 +899,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_output_bytes_written,
             writer_bytes_per_second_estimate,
             writer_last_progress_micros,
-            writer_next_expected_batch_id,
+            writer_next_expected_batch_id_for_thread,
             writer_runtime_config,
             pipeline_start,
         )
