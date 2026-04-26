@@ -125,12 +125,30 @@ def parse_stage_metrics(path):
     row.update(parse_stage_kv('direct_output_flow_summary'))
     row.update(parse_stage_kv('writer_tail_breakdown'))
     row.update(parse_stage_kv('output_flow_controller_summary'))
+    row.update(parse_stage_kv('direct_reader_diagnostics'))
+    row.update(parse_stage_kv('direct_pipeline_diagnostics'))
     row.update(parse_stage_kv('direct_total_summary'))
 
     legacy_total = parse_stage_kv('direct_summary').get('total_output_drain_seconds')
     if legacy_total and 'writer_tail_seconds' in row:
         row['legacy_total_output_drain_seconds'] = legacy_total
         row['total_output_drain_seconds_rejected'] = 'true'
+
+    aliases = {
+        'writer_drain_seconds': 'writer_tail_seconds',
+        'forward_reader_chunks': 'forward_reader_chunks_sent',
+        'reverse_reader_chunks': 'reverse_reader_chunks_sent',
+        'forward_reader_records': 'forward_records_decoded',
+        'reverse_reader_records': 'reverse_records_decoded',
+        'forward_reader_queue_full_wait_seconds': 'forward_reader_send_wait_seconds',
+        'reverse_reader_queue_full_wait_seconds': 'reverse_reader_send_wait_seconds',
+        'sync_wait_forward_seconds': 'sync_wait_for_forward_chunk_seconds',
+        'sync_wait_reverse_seconds': 'sync_wait_for_reverse_chunk_seconds',
+        'writer_tail_primary_cause': 'writer_drain_primary_cause',
+    }
+    for out_key, source_key in aliases.items():
+        if out_key not in row and source_key in row:
+            row[out_key] = row[source_key]
 
     return row
 

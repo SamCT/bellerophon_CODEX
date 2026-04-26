@@ -2653,20 +2653,28 @@ impl OutputFlowController {
         } else {
             1.0 * 1024.0 * 1024.0
         };
-        let target_lag_seconds = if density > 4.0 * 1024.0 * 1024.0 {
-            0.35
+        let baseline_target_lag_seconds = if density > 4.0 * 1024.0 * 1024.0 {
+            0.32
         } else {
-            0.9
+            0.72
         };
+        let current_lag_seconds = Self::debt_bytes(inner) as f64 / bps.max(1.0);
+        let lag_tightening = if current_lag_seconds > baseline_target_lag_seconds * 2.4 {
+            0.45
+        } else if current_lag_seconds > baseline_target_lag_seconds * 1.5 {
+            0.65
+        } else {
+            1.0
+        };
+        let target_lag_seconds = (baseline_target_lag_seconds * lag_tightening).max(0.12);
         let debt_byte_limit = (bps * target_lag_seconds).max(8.0 * 1024.0 * 1024.0) as u64;
         let debt_batch_limit =
-            ((debt_byte_limit as f64 / density.max(256.0)).ceil() as u64).clamp(4, 128);
+            ((debt_byte_limit as f64 / density.max(256.0)).ceil() as u64).clamp(4, 96);
         let ordered_batch_limit = (debt_batch_limit / 2).max(2);
         let ordered_byte_limit = debt_byte_limit / 2;
-        let lag_seconds = Self::debt_bytes(inner) as f64 / bps.max(1.0);
-        let adaptive_compute = if lag_seconds > target_lag_seconds * 2.5 {
+        let adaptive_compute = if current_lag_seconds > target_lag_seconds * 2.5 {
             1
-        } else if lag_seconds > target_lag_seconds * 1.5 {
+        } else if current_lag_seconds > target_lag_seconds * 1.5 {
             (max_compute_workers / 2).max(1)
         } else {
             max_compute_workers.max(1)
@@ -3869,23 +3877,17 @@ fn resolve_direct_queue_policy(requested_threads: usize, cli: &Cli) -> DirectQue
     } else {
         24
     };
-    let reader_queue_capacity = if bounded_threads <= 64 {
-        if cli.direct_reader_chunk_groups >= 1024 {
-            4
-        } else {
-            8
-        }
-    } else if bounded_threads <= 128 {
-        if cli.direct_reader_chunk_groups >= 1024 {
-            8
-        } else {
-            16
-        }
-    } else if cli.direct_reader_chunk_groups >= 1024 {
-        6
+    let thread_capacity_base = (6.0 + (bounded_threads as f64).sqrt()).round() as usize;
+    let chunk_group_penalty = if cli.direct_reader_chunk_groups >= 1024 {
+        3usize
+    } else if cli.direct_reader_chunk_groups >= 768 {
+        2usize
     } else {
-        12
+        0usize
     };
+    let reader_queue_capacity = thread_capacity_base
+        .saturating_sub(chunk_group_penalty)
+        .clamp(4, 16);
     DirectQueuePolicy {
         output_queue_capacity,
         reader_queue_capacity,
