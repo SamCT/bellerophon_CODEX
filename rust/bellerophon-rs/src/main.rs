@@ -8,6 +8,10 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::Instant;
 use tempfile::Builder;
@@ -136,6 +140,7 @@ struct DirectOutputBatch {
 struct DirectWorkerStats {
     pair_stats: PairFilterStats,
     writer_loop_seconds: f64,
+    writer_recv_wait_seconds: f64,
     process_seconds: f64,
     write_call_seconds: f64,
     output_drop_close_seconds: f64,
@@ -399,7 +404,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_thread_resolution requested_threads={} detected_available_parallelism={} explicit_user_cap={} resolved_total_threads={} shared_bgzf_pool_workers={} shared_pool_intended_per_reader_bgzf_workers={} shared_pool_intended_writer_bgzf_workers={} compute_workers={} assigned_threads={} unused_threads={} htslib_pool_enabled={}",
+            "STAGE direct_thread_resolution requested_threads={} detected_available_parallelism={} explicit_user_cap={} resolved_total_threads={} shared_bgzf_pool_workers={} shared_pool_intended_per_reader_bgzf_workers={} shared_pool_intended_writer_bgzf_workers={} compute_workers={} assigned_threads={} unused_threads={} htslib_pool_enabled={} allocation_mode=auto_shared_pool",
             thread_resolution.requested_threads,
             thread_resolution.detected_available_parallelism,
             thread_resolution
@@ -488,9 +493,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
             .with_context(|| format!("failed to set output compression level {level}"))?;
     }
     let (batch_sender, batch_receiver) = sync_channel::<DirectInputBatch>(8);
+    let queue_depth = Arc::new(AtomicUsize::new(0));
+    let max_queue_depth = Arc::new(AtomicUsize::new(0));
     let quality = cli.quality;
-    let writer_handle =
-        thread::spawn(move || direct_writer_thread(batch_receiver, output, quality));
+    let writer_handle = thread::spawn({
+        let queue_depth = Arc::clone(&queue_depth);
+        move || direct_writer_thread(batch_receiver, output, quality, queue_depth)
+    });
 
     stage_log(
         cli,
@@ -508,13 +517,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
     );
 
     let read_match_start = Instant::now();
-    let mut read_decode_seconds = 0.0f64;
+    let mut forward_read_decode_seconds = 0.0f64;
+    let mut reverse_read_decode_seconds = 0.0f64;
     let mut pair_match_assembly_seconds = 0.0f64;
     let mut batch_enqueue_wait_seconds = 0.0f64;
-    let producer_blocked_seconds = 0.0f64;
-    let writer_wait_for_sequence_seconds = 0.0f64;
-    let writer_idle_seconds = 0.0f64;
-    let mut max_queue_depth: usize = 1;
     let mut groups_seen: u64 = 0;
 
     let mut forward_pending = None;
@@ -529,13 +535,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
             &mut forward_reader,
             &mut forward_pending,
             &mut forward_record,
-            &mut read_decode_seconds,
+            &mut forward_read_decode_seconds,
         )?;
         let next_reverse = next_group_records_read(
             &mut reverse_reader,
             &mut reverse_pending,
             &mut reverse_record,
-            &mut read_decode_seconds,
+            &mut reverse_read_decode_seconds,
         )?;
         let match_start = Instant::now();
         match (next_forward, next_reverse) {
@@ -554,6 +560,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     flush_direct_batch(
                         &mut active_batch,
                         &batch_sender,
+                        &queue_depth,
+                        &max_queue_depth,
                         &mut batch_enqueue_wait_seconds,
                         cli.direct_batch_size,
                     )?;
@@ -564,6 +572,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     flush_direct_batch(
                         &mut active_batch,
                         &batch_sender,
+                        &queue_depth,
+                        &max_queue_depth,
                         &mut batch_enqueue_wait_seconds,
                         cli.direct_batch_size,
                     )?;
@@ -575,6 +585,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
         pair_match_assembly_seconds += match_start.elapsed().as_secs_f64();
     }
     let read_match_seconds = read_match_start.elapsed().as_secs_f64();
+    let read_decode_seconds = forward_read_decode_seconds + reverse_read_decode_seconds;
     let qname_group_seconds =
         (read_match_seconds - read_decode_seconds - pair_match_assembly_seconds).max(0.0);
     drop(batch_sender);
@@ -586,6 +597,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let stats = writer_stats.pair_stats;
     let process_seconds = writer_stats.process_seconds;
     let writer_loop_seconds = writer_stats.writer_loop_seconds;
+    let writer_recv_wait_seconds = writer_stats.writer_recv_wait_seconds;
+    let writer_idle_seconds = writer_recv_wait_seconds;
     let write_call_seconds = writer_stats.write_call_seconds;
     let output_drop_close_seconds = writer_stats.output_drop_close_seconds;
     let batches_processed = writer_stats.batches_processed;
@@ -604,7 +617,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_process groups={} candidate_pairs={} selected_groups_fwd={} selected_groups_rev={} missing_candidate={} low_mapq={} mismatched={} read_match_seconds={:.6} bam_read_decode_seconds={:.6} qname_group_seconds={:.6} match_assembly_seconds={:.6} writer_loop_seconds={:.6} process_seconds={:.6} write_call_seconds={:.6} output_drop_close_seconds={:.6}",
+            "STAGE direct_process groups={} candidate_pairs={} selected_groups_fwd={} selected_groups_rev={} missing_candidate={} low_mapq={} mismatched={} read_match_seconds={:.6} bam_read_decode_seconds={:.6} bam_read_decode_forward_seconds={:.6} bam_read_decode_reverse_seconds={:.6} qname_group_seconds={:.6} match_assembly_seconds={:.6} writer_recv_wait_seconds={:.6} writer_loop_seconds={:.6} process_seconds={:.6} write_call_seconds={:.6} output_drop_close_seconds={:.6}",
             stats.groups,
             stats.candidate_pairs,
             stats.candidate_groups_fwd,
@@ -614,8 +627,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
             stats.mismatched,
             read_match_seconds,
             read_decode_seconds,
+            forward_read_decode_seconds,
+            reverse_read_decode_seconds,
             qname_group_seconds,
             pair_match_assembly_seconds,
+            writer_recv_wait_seconds,
             writer_loop_seconds,
             process_seconds,
             write_call_seconds,
@@ -633,9 +649,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_drain_seconds
         ),
     );
-    if batches_processed > 0 {
-        max_queue_depth = max_queue_depth.max(1);
-    }
+    let max_queue_depth = max_queue_depth.load(Ordering::Relaxed).max(1);
     let average_batch_size = if batches_processed > 0 {
         total_batch_size as f64 / batches_processed as f64
     } else {
@@ -645,9 +659,9 @@ fn run_direct(cli: &Cli) -> Result<()> {
         cli,
         format!(
             "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} max_queue_depth={} producer_blocked_seconds={:.6} writer_idle_seconds={:.6} batches_processed={} average_batch_size={:.3} max_batch_size={}",
-            writer_wait_for_sequence_seconds,
+            writer_recv_wait_seconds,
             max_queue_depth,
-            producer_blocked_seconds,
+            batch_enqueue_wait_seconds,
             writer_idle_seconds,
             batches_processed,
             average_batch_size,
@@ -673,6 +687,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
 fn flush_direct_batch(
     active_batch: &mut Vec<(DirectRecordGroup, DirectRecordGroup)>,
     batch_sender: &SyncSender<DirectInputBatch>,
+    queue_depth: &Arc<AtomicUsize>,
+    max_queue_depth: &Arc<AtomicUsize>,
     batch_enqueue_wait_seconds: &mut f64,
     direct_batch_size: usize,
 ) -> Result<()> {
@@ -686,6 +702,19 @@ fn flush_direct_batch(
     batch_sender
         .send(batch)
         .context("failed to send direct batch to writer thread")?;
+    let depth = queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+    loop {
+        let previous_max = max_queue_depth.load(Ordering::Relaxed);
+        if depth <= previous_max {
+            break;
+        }
+        if max_queue_depth
+            .compare_exchange(previous_max, depth, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
     *batch_enqueue_wait_seconds += enqueue_start.elapsed().as_secs_f64();
     Ok(())
 }
@@ -694,10 +723,18 @@ fn direct_writer_thread(
     batch_receiver: Receiver<DirectInputBatch>,
     mut output: Writer,
     quality: u8,
+    queue_depth: Arc<AtomicUsize>,
 ) -> Result<DirectWorkerStats> {
     let writer_loop_start = Instant::now();
     let mut worker_stats = DirectWorkerStats::default();
-    while let Ok(batch) = batch_receiver.recv() {
+    loop {
+        let recv_wait_start = Instant::now();
+        let batch = match batch_receiver.recv() {
+            Ok(batch) => batch,
+            Err(_) => break,
+        };
+        worker_stats.writer_recv_wait_seconds += recv_wait_start.elapsed().as_secs_f64();
+        queue_depth.fetch_sub(1, Ordering::Relaxed);
         worker_stats.batches_processed += 1;
         worker_stats.total_batch_size += batch.groups.len() as u64;
         worker_stats.max_batch_size = worker_stats.max_batch_size.max(batch.groups.len());
@@ -1336,19 +1373,15 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
     // - BGZF workers for the two input readers
     // - BGZF workers for the output writer
     let htslib_pool_enabled = true;
-    let mut compute_workers = (resolved_total_threads / 16).max(1);
+    let mut compute_workers = 1usize;
     if compute_workers >= resolved_total_threads {
         compute_workers = resolved_total_threads.saturating_sub(1);
     }
     let total_bgzf_workers = resolved_total_threads
         .saturating_sub(compute_workers)
         .max(1);
-    let mut reader_total_bgzf_workers = (resolved_total_threads / 3).max(2);
-    let max_reader_bgzf_workers = total_bgzf_workers.saturating_sub(1);
-    reader_total_bgzf_workers = reader_total_bgzf_workers.min(max_reader_bgzf_workers);
-    let shared_pool_intended_per_reader_bgzf_workers = reader_total_bgzf_workers / 2;
-    let shared_pool_intended_writer_bgzf_workers =
-        total_bgzf_workers.saturating_sub(reader_total_bgzf_workers);
+    let shared_pool_intended_per_reader_bgzf_workers = 0;
+    let shared_pool_intended_writer_bgzf_workers = 0;
     let assigned_threads = total_bgzf_workers + compute_workers;
     let unused_threads = resolved_total_threads.saturating_sub(assigned_threads);
 
