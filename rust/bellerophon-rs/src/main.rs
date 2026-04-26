@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -193,6 +193,11 @@ struct DirectWorkerStats {
     estimated_uncompressed_bytes_written: u64,
     ordered_writer_pending_batches_max: usize,
     ordered_writer_wait_for_next_batch_seconds: f64,
+    ordered_writer_missing_batch_wait_events: u64,
+    ordered_writer_max_gap: u64,
+    ordered_writer_pending_map_max_size: usize,
+    ordered_writer_next_expected_batch_id: u64,
+    ordered_writer_largest_received_batch_id: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -202,9 +207,12 @@ struct DirectComputeStats {
     compute_records_selected: u64,
     compute_filter_seconds_total: f64,
     compute_filter_wall_seconds: f64,
-    compute_input_wait_seconds: f64,
-    compute_output_send_wait_seconds: f64,
+    compute_input_wait_thread_seconds_total: f64,
+    compute_output_send_wait_thread_seconds_total: f64,
+    compute_input_wait_wall_seconds: f64,
+    compute_output_send_wait_wall_seconds: f64,
     compute_output_queue_full_events: u64,
+    compute_to_writer_queue_max_depth: usize,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -638,18 +646,38 @@ fn run_direct(cli: &Cli) -> Result<()> {
         sync_channel::<DirectOutputBatch>(queue_policy.output_queue_capacity);
     let input_queue_depth = Arc::new(AtomicUsize::new(0));
     let input_queue_max_depth = Arc::new(AtomicUsize::new(0));
+    let output_queue_submitted = Arc::new(AtomicU64::new(0));
+    let output_queue_received = Arc::new(AtomicU64::new(0));
+    let output_queue_max_depth = Arc::new(AtomicUsize::new(0));
     let input_batch_receiver = Arc::new(Mutex::new(input_batch_receiver));
     let mut compute_handles = Vec::with_capacity(thread_resolution.compute_workers);
     for _ in 0..thread_resolution.compute_workers {
         let worker_receiver = Arc::clone(&input_batch_receiver);
         let worker_sender = output_batch_sender.clone();
         let worker_quality = cli.quality;
+        let worker_input_queue_depth = Arc::clone(&input_queue_depth);
+        let worker_output_queue_submitted = Arc::clone(&output_queue_submitted);
+        let worker_output_queue_received = Arc::clone(&output_queue_received);
+        let worker_output_queue_max_depth = Arc::clone(&output_queue_max_depth);
+        let worker_output_queue_capacity = queue_policy.output_queue_capacity;
         compute_handles.push(thread::spawn(move || {
-            direct_compute_thread(worker_receiver, worker_sender, worker_quality)
+            direct_compute_thread(
+                worker_receiver,
+                worker_sender,
+                worker_quality,
+                worker_input_queue_depth,
+                worker_output_queue_submitted,
+                worker_output_queue_received,
+                worker_output_queue_max_depth,
+                worker_output_queue_capacity,
+            )
         }));
     }
     drop(output_batch_sender);
-    let writer_handle = thread::spawn(move || direct_writer_thread(output_batch_receiver, output));
+    let writer_output_queue_received = Arc::clone(&output_queue_received);
+    let writer_handle = thread::spawn(move || {
+        direct_writer_thread(output_batch_receiver, output, writer_output_queue_received)
+    });
 
     stage_log(
         cli,
@@ -839,6 +867,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let qname_group_seconds =
         (read_match_seconds - read_decode_seconds - pair_match_assembly_seconds).max(0.0);
     let pending_batches_before_close = input_queue_depth.load(Ordering::Relaxed);
+    let input_batches_submitted = next_batch_id;
     drop(input_batch_sender);
     let mut compute_stats = DirectComputeStats {
         compute_workers: thread_resolution.compute_workers,
@@ -851,15 +880,24 @@ fn run_direct(cli: &Cli) -> Result<()> {
         compute_stats.compute_batches_processed += worker_stats.compute_batches_processed;
         compute_stats.compute_records_selected += worker_stats.compute_records_selected;
         compute_stats.compute_filter_seconds_total += worker_stats.compute_filter_seconds_total;
-        compute_stats.compute_input_wait_seconds += worker_stats.compute_input_wait_seconds;
-        compute_stats.compute_output_send_wait_seconds +=
-            worker_stats.compute_output_send_wait_seconds;
+        compute_stats.compute_input_wait_thread_seconds_total +=
+            worker_stats.compute_input_wait_thread_seconds_total;
+        compute_stats.compute_output_send_wait_thread_seconds_total +=
+            worker_stats.compute_output_send_wait_thread_seconds_total;
+        compute_stats.compute_input_wait_wall_seconds = compute_stats
+            .compute_input_wait_wall_seconds
+            .max(worker_stats.compute_input_wait_wall_seconds);
+        compute_stats.compute_output_send_wait_wall_seconds = compute_stats
+            .compute_output_send_wait_wall_seconds
+            .max(worker_stats.compute_output_send_wait_wall_seconds);
         compute_stats.compute_output_queue_full_events +=
             worker_stats.compute_output_queue_full_events;
         compute_stats.compute_filter_wall_seconds = compute_stats
             .compute_filter_wall_seconds
             .max(worker_stats.compute_filter_wall_seconds);
     }
+    compute_stats.compute_to_writer_queue_max_depth =
+        output_queue_max_depth.load(Ordering::Relaxed);
     drop(shared_bgzf_pool);
     drop(output_bgzf_pool);
     let writer_wait_start = Instant::now();
@@ -949,7 +987,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_drain_seconds
         ),
     );
-    let max_queue_depth = input_queue_max_depth.load(Ordering::Relaxed).max(1);
+    let max_input_queue_depth = input_queue_max_depth.load(Ordering::Relaxed);
+    let max_output_queue_depth = compute_stats.compute_to_writer_queue_max_depth;
     let average_batch_size = if batches_processed > 0 {
         total_batch_size as f64 / batches_processed as f64
     } else {
@@ -987,12 +1026,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} input_to_compute_queue_max_depth={} input_to_compute_queue_capacity={} compute_to_writer_queue_capacity={} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} input_to_compute_queue_full_events={} compute_to_writer_queue_full_events={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
+            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} input_to_compute_queue_max_depth={} input_to_compute_queue_capacity={} compute_to_writer_queue_max_depth={} compute_to_writer_queue_capacity={} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} input_batches_submitted={} output_batches_submitted={} batches_created={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} input_to_compute_queue_full_events={} compute_to_writer_queue_full_events={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
             writer_recv_wait_seconds,
-            max_queue_depth,
+            max_input_queue_depth,
             queue_policy.output_queue_capacity,
+            max_output_queue_depth,
             queue_policy.output_queue_capacity,
-            max_queue_depth,
+            max_output_queue_depth,
             queue_policy.output_queue_capacity,
             reader_chunk_queue_stats.max_depth,
             queue_policy.reader_queue_capacity,
@@ -1009,6 +1049,9 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_receive_count,
             average_batch_size,
             max_batch_size,
+            input_batches_submitted,
+            output_queue_submitted.load(Ordering::Relaxed),
+            input_batches_submitted,
             pending_batches_before_close,
             writer_stats.records_written,
             writer_records_per_second,
@@ -1041,17 +1084,24 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_compute_diagnostics compute_workers={} compute_batches_processed={} compute_records_selected={} compute_filter_seconds_total={:.6} compute_filter_wall_seconds={:.6} compute_input_wait_seconds={:.6} compute_output_send_wait_seconds={:.6} compute_output_queue_full_events={} ordered_writer_pending_batches_max={} ordered_writer_wait_for_next_batch_seconds={:.6} ordered_writer_write_seconds={:.6} ordered_writer_records_per_second={:.3}",
+            "STAGE direct_compute_diagnostics compute_workers={} compute_batches_processed={} compute_records_selected={} compute_filter_seconds_total={:.6} compute_filter_wall_seconds={:.6} compute_input_wait_thread_seconds_total={:.6} compute_output_send_wait_thread_seconds_total={:.6} compute_input_wait_wall_seconds={:.6} compute_output_send_wait_wall_seconds={:.6} compute_output_queue_full_events={} ordered_writer_pending_batches_max={} ordered_writer_wait_for_next_batch_seconds={:.6} ordered_writer_missing_batch_wait_events={} ordered_writer_max_gap={} ordered_writer_pending_map_max_size={} ordered_writer_next_expected_batch_id={} ordered_writer_largest_received_batch_id={} ordered_writer_write_seconds={:.6} ordered_writer_records_per_second={:.3}",
             compute_stats.compute_workers,
             compute_stats.compute_batches_processed,
             compute_stats.compute_records_selected,
             compute_stats.compute_filter_seconds_total,
             compute_stats.compute_filter_wall_seconds,
-            compute_stats.compute_input_wait_seconds,
-            compute_stats.compute_output_send_wait_seconds,
+            compute_stats.compute_input_wait_thread_seconds_total,
+            compute_stats.compute_output_send_wait_thread_seconds_total,
+            compute_stats.compute_input_wait_wall_seconds,
+            compute_stats.compute_output_send_wait_wall_seconds,
             compute_stats.compute_output_queue_full_events,
             writer_stats.ordered_writer_pending_batches_max,
             writer_stats.ordered_writer_wait_for_next_batch_seconds,
+            writer_stats.ordered_writer_missing_batch_wait_events,
+            writer_stats.ordered_writer_max_gap,
+            writer_stats.ordered_writer_pending_map_max_size,
+            writer_stats.ordered_writer_next_expected_batch_id,
+            writer_stats.ordered_writer_largest_received_batch_id,
             write_call_seconds,
             writer_records_per_second
         ),
@@ -1500,8 +1550,15 @@ fn direct_compute_thread(
     batch_receiver: Arc<Mutex<Receiver<DirectInputBatch>>>,
     output_sender: SyncSender<DirectOutputBatch>,
     quality: u8,
+    input_queue_depth: Arc<AtomicUsize>,
+    output_queue_submitted: Arc<AtomicU64>,
+    output_queue_received: Arc<AtomicU64>,
+    output_queue_max_depth: Arc<AtomicUsize>,
+    output_queue_capacity: usize,
 ) -> Result<DirectComputeStats> {
     let worker_start = Instant::now();
+    let mut compute_input_wait_wall_seconds = 0.0f64;
+    let mut compute_output_send_wait_wall_seconds = 0.0f64;
     let mut stats = DirectComputeStats::default();
     loop {
         let recv_wait_start = Instant::now();
@@ -1513,27 +1570,56 @@ fn direct_compute_thread(
         };
         match batch {
             Ok(batch) => {
-                stats.compute_input_wait_seconds += recv_wait_start.elapsed().as_secs_f64();
+                let input_wait_seconds = recv_wait_start.elapsed().as_secs_f64();
+                stats.compute_input_wait_thread_seconds_total += input_wait_seconds;
+                compute_input_wait_wall_seconds += input_wait_seconds;
+                input_queue_depth.fetch_sub(1, Ordering::Relaxed);
                 stats.compute_batches_processed += 1;
                 let output_batch = process_direct_batch(batch, quality);
                 stats.compute_records_selected += (output_batch.records.len() * 2) as u64;
                 stats.compute_filter_seconds_total += output_batch.filter_seconds;
+                let queue_depth_before_send = output_queue_submitted
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(output_queue_received.load(Ordering::Relaxed));
+                if queue_depth_before_send >= output_queue_capacity as u64 {
+                    stats.compute_output_queue_full_events += 1;
+                }
                 let send_wait_start = Instant::now();
                 if output_sender.send(output_batch).is_err() {
                     break;
                 }
-                stats.compute_output_send_wait_seconds += send_wait_start.elapsed().as_secs_f64();
+                let output_wait_seconds = send_wait_start.elapsed().as_secs_f64();
+                stats.compute_output_send_wait_thread_seconds_total += output_wait_seconds;
+                compute_output_send_wait_wall_seconds += output_wait_seconds;
+                let submitted = output_queue_submitted.fetch_add(1, Ordering::Relaxed) + 1;
+                let received = output_queue_received.load(Ordering::Relaxed);
+                let depth = submitted.saturating_sub(received) as usize;
+                loop {
+                    let previous_max = output_queue_max_depth.load(Ordering::Relaxed);
+                    if depth <= previous_max {
+                        break;
+                    }
+                    if output_queue_max_depth
+                        .compare_exchange(previous_max, depth, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
             }
             Err(_) => break,
         }
     }
     stats.compute_filter_wall_seconds = worker_start.elapsed().as_secs_f64();
+    stats.compute_input_wait_wall_seconds = compute_input_wait_wall_seconds;
+    stats.compute_output_send_wait_wall_seconds = compute_output_send_wait_wall_seconds;
     Ok(stats)
 }
 
 fn direct_writer_thread(
     batch_receiver: Receiver<DirectOutputBatch>,
     mut output: Writer,
+    output_queue_received: Arc<AtomicU64>,
 ) -> Result<DirectWorkerStats> {
     let writer_loop_start = Instant::now();
     let mut worker_stats = DirectWorkerStats::default();
@@ -1545,10 +1631,23 @@ fn direct_writer_thread(
             Ok(batch) => batch,
             Err(_) => break,
         };
+        output_queue_received.fetch_add(1, Ordering::Relaxed);
         worker_stats.writer_recv_wait_seconds += recv_wait_start.elapsed().as_secs_f64();
+        worker_stats.ordered_writer_largest_received_batch_id = worker_stats
+            .ordered_writer_largest_received_batch_id
+            .max(output_batch.batch_id);
+        if output_batch.batch_id > next_batch_id {
+            worker_stats.ordered_writer_missing_batch_wait_events += 1;
+            worker_stats.ordered_writer_max_gap = worker_stats
+                .ordered_writer_max_gap
+                .max(output_batch.batch_id - next_batch_id);
+        }
         pending.insert(output_batch.batch_id, output_batch);
         worker_stats.ordered_writer_pending_batches_max = worker_stats
             .ordered_writer_pending_batches_max
+            .max(pending.len());
+        worker_stats.ordered_writer_pending_map_max_size = worker_stats
+            .ordered_writer_pending_map_max_size
             .max(pending.len());
         let order_wait_start = Instant::now();
         while let Some(batch) = pending.remove(&next_batch_id) {
@@ -1580,6 +1679,7 @@ fn direct_writer_thread(
             worker_stats.write_call_seconds += write_start.elapsed().as_secs_f64();
             next_batch_id += 1;
         }
+        worker_stats.ordered_writer_next_expected_batch_id = next_batch_id;
     }
     if !pending.is_empty() {
         bail!("ordered writer terminated with pending out-of-order batches");
