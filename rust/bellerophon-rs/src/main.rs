@@ -215,6 +215,14 @@ struct QueueDepthStats {
     full_events: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DirectQueuePolicy {
+    output_queue_capacity: usize,
+    reader_queue_capacity: usize,
+    reader_chunk_groups: usize,
+    batch_size: usize,
+}
+
 #[derive(Default, Clone, Copy, Debug)]
 struct SplitBgzfWorkers {
     forward: usize,
@@ -472,8 +480,6 @@ fn run_pair_temp(cli: &Cli) -> Result<()> {
 }
 
 fn run_direct(cli: &Cli) -> Result<()> {
-    const MATCHER_OUTPUT_QUEUE_CAPACITY: usize = 8;
-    const READER_CHUNK_QUEUE_CAPACITY: usize = 4;
     let setup_start = Instant::now();
     let thread_resolution = resolve_direct_thread_roles(cli.threads);
     stage_log(
@@ -546,6 +552,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     if cli.direct_sync_lookahead_groups == 0 {
         bail!("--direct-sync-lookahead-groups must be at least 1");
     }
+    let queue_policy = resolve_direct_queue_policy(thread_resolution.requested_threads, cli);
 
     let forward_header_reader = bam::Reader::from_path(&cli.forward)
         .with_context(|| format!("failed to open forward input {}", cli.forward.display()))?;
@@ -596,7 +603,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             .with_context(|| format!("failed to set output compression level {level}"))?;
     }
     let (batch_sender, batch_receiver) =
-        sync_channel::<DirectInputBatch>(MATCHER_OUTPUT_QUEUE_CAPACITY);
+        sync_channel::<DirectInputBatch>(queue_policy.output_queue_capacity);
     let queue_depth = Arc::new(AtomicUsize::new(0));
     let max_queue_depth = Arc::new(AtomicUsize::new(0));
     let quality = cli.quality;
@@ -608,7 +615,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} reader_mode={}",
+            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} reader_mode={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_queue_policy=auto_bounded",
             setup_start.elapsed().as_secs_f64(),
             thread_resolution.total_bgzf_workers,
             thread_resolution.compute_workers,
@@ -621,7 +628,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
             split_workers.forward,
             split_workers.reverse,
             split_workers.output,
-            direct_reader_mode_name(&cli.direct_reader_mode)
+            direct_reader_mode_name(&cli.direct_reader_mode),
+            queue_policy.output_queue_capacity,
+            queue_policy.reader_queue_capacity,
+            queue_policy.reader_chunk_groups
         ),
     );
 
@@ -684,7 +694,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     cli.direct_batch_size,
                     &mut groups_seen,
                     &mut pair_match_assembly_seconds,
-                    MATCHER_OUTPUT_QUEUE_CAPACITY,
+                    queue_policy.output_queue_capacity,
                     &mut output_queue_full_events,
                 )?;
                 if done {
@@ -696,16 +706,16 @@ fn run_direct(cli: &Cli) -> Result<()> {
             reader_threads_spawned = 2;
             reader_threads_active_high_watermark = 2;
             let (forward_tx, forward_rx) =
-                sync_channel::<Result<Option<ReaderChunk>>>(READER_CHUNK_QUEUE_CAPACITY);
+                sync_channel::<Result<Option<ReaderChunk>>>(queue_policy.reader_queue_capacity);
             let (reverse_tx, reverse_rx) =
-                sync_channel::<Result<Option<ReaderChunk>>>(READER_CHUNK_QUEUE_CAPACITY);
+                sync_channel::<Result<Option<ReaderChunk>>>(queue_policy.reader_queue_capacity);
             let forward_chunk_depth = Arc::new(AtomicUsize::new(0));
             let reverse_chunk_depth = Arc::new(AtomicUsize::new(0));
             let forward_chunk_max_depth = Arc::new(AtomicUsize::new(0));
             let reverse_chunk_max_depth = Arc::new(AtomicUsize::new(0));
             let forward_path = cli.forward.clone();
             let reverse_path = cli.reverse.clone();
-            let chunk_groups = cli.direct_reader_chunk_groups;
+            let chunk_groups = queue_policy.reader_chunk_groups;
             let forward_threads = split_workers.forward.max(1);
             let reverse_threads = split_workers.reverse.max(1);
             let forward_chunk_depth_reader = Arc::clone(&forward_chunk_depth);
@@ -717,7 +727,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     chunk_groups,
                     forward_threads,
                     "forward",
-                    READER_CHUNK_QUEUE_CAPACITY,
+                    queue_policy.reader_queue_capacity,
                     forward_chunk_depth_reader,
                     forward_chunk_max_depth_reader,
                 )
@@ -731,7 +741,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     chunk_groups,
                     reverse_threads,
                     "reverse",
-                    READER_CHUNK_QUEUE_CAPACITY,
+                    queue_policy.reader_queue_capacity,
                     reverse_chunk_depth_reader,
                     reverse_chunk_max_depth_reader,
                 )
@@ -750,7 +760,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 &mut groups_seen,
                 &mut pair_match_assembly_seconds,
                 cli.direct_sync_lookahead_groups,
-                MATCHER_OUTPUT_QUEUE_CAPACITY,
+                queue_policy.output_queue_capacity,
                 &mut output_queue_full_events,
             )?;
             forward_reader_stats = forward_handle
@@ -806,6 +816,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
     } else {
         0.0
     };
+    let reader_decode_wall_seconds = forward_reader_stats
+        .wall_seconds
+        .max(reverse_reader_stats.wall_seconds);
+    let reader_decode_thread_seconds =
+        forward_reader_stats.decode_seconds + reverse_reader_stats.decode_seconds;
 
     if write_call_seconds > process_seconds && stats.final_pairs > 0 {
         stage_log(
@@ -813,6 +828,15 @@ fn run_direct(cli: &Cli) -> Result<()> {
             format!(
                 "STAGE direct_saturation reason=write_call_dominates write_call_seconds={:.6} process_seconds={:.6} note=consider_faster_storage_or_lower_compression",
                 write_call_seconds, process_seconds
+            ),
+        );
+    }
+    if process_seconds >= write_call_seconds && stats.final_pairs > 0 {
+        stage_log(
+            cli,
+            format!(
+                "STAGE direct_saturation reason=writer_compute_dominates writer_process_seconds={:.6} writer_write_call_seconds={:.6} note=consider_moving_pair_selection_out_of_writer_thread",
+                process_seconds, write_call_seconds
             ),
         );
     }
@@ -843,9 +867,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_reader_diagnostics forward_reader_wall_seconds={:.6} reverse_reader_wall_seconds={:.6} forward_records_decoded={} reverse_records_decoded={} forward_decode_records_per_second={:.3} reverse_decode_records_per_second={:.3} reader_threads_spawned={} reader_threads_active_high_watermark={}",
+            "STAGE direct_reader_diagnostics forward_reader_wall_seconds={:.6} reverse_reader_wall_seconds={:.6} reader_decode_wall_seconds={:.6} reader_decode_thread_seconds={:.6} forward_records_decoded={} reverse_records_decoded={} forward_decode_records_per_second={:.3} reverse_decode_records_per_second={:.3} reader_threads_spawned={} reader_threads_active_high_watermark={}",
             forward_reader_stats.wall_seconds,
             reverse_reader_stats.wall_seconds,
+            reader_decode_wall_seconds,
+            reader_decode_thread_seconds,
             forward_reader_stats.records_decoded,
             reverse_reader_stats.records_decoded,
             forward_decode_rps,
@@ -878,6 +904,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
     } else {
         0.0
     };
+    let writer_batches_per_second = if writer_loop_seconds > 0.0 {
+        batches_processed as f64 / writer_loop_seconds
+    } else {
+        0.0
+    };
     let total_chunks_sent = forward_reader_stats.chunks_sent + reverse_reader_stats.chunks_sent;
     let total_chunk_groups =
         forward_reader_stats.total_chunk_groups + reverse_reader_stats.total_chunk_groups;
@@ -892,12 +923,12 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} estimated_uncompressed_bytes_written={} output_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} bgzf_worker_utilization=not_exposed_by_htslib_api",
+            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
             writer_recv_wait_seconds,
             max_queue_depth,
-            MATCHER_OUTPUT_QUEUE_CAPACITY,
+            queue_policy.output_queue_capacity,
             reader_chunk_queue_stats.max_depth,
-            READER_CHUNK_QUEUE_CAPACITY,
+            queue_policy.reader_queue_capacity,
             batch_enqueue_wait_seconds,
             matcher_send_wait_seconds,
             forward_reader_stats.send_wait_seconds,
@@ -910,23 +941,43 @@ fn run_direct(cli: &Cli) -> Result<()> {
             pending_batches_before_close,
             writer_stats.records_written,
             writer_records_per_second,
+            writer_batches_per_second,
+            write_call_seconds,
+            process_seconds,
+            process_seconds,
+            write_call_seconds,
+            writer_recv_wait_seconds,
+            average_batch_size * 2.0,
             writer_stats.estimated_uncompressed_bytes_written,
+            output_queue_full_events,
+            reader_chunk_queue_stats.full_events,
             output_queue_full_events + reader_chunk_queue_stats.full_events,
             average_chunk_groups,
-            max_chunk_groups
+            max_chunk_groups,
+            queue_policy.output_queue_capacity,
+            queue_policy.reader_queue_capacity,
+            queue_policy.reader_chunk_groups,
+            queue_policy.batch_size
         ),
     );
+    let close_to_write_ratio = if write_call_seconds > 0.0 {
+        writer_stats.hts_close_seconds / write_call_seconds
+    } else {
+        0.0
+    };
+    let close_note = if close_to_write_ratio >= 0.25 {
+        "high_ratio_suggests_writer_backlog_flushed_during_close"
+    } else {
+        "close_time_not_dominant"
+    };
     stage_log(
         cli,
         format!(
-            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note=high_ratio_suggests_writer_backlog_flushed_during_close",
+            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={}",
             write_call_seconds,
             writer_stats.hts_close_seconds,
-            if write_call_seconds > 0.0 {
-                writer_stats.hts_close_seconds / write_call_seconds
-            } else {
-                0.0
-            }
+            close_to_write_ratio,
+            close_note
         ),
     );
 
@@ -2023,6 +2074,36 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
         assigned_threads,
         unused_threads,
         htslib_pool_enabled,
+    }
+}
+
+fn resolve_direct_queue_policy(requested_threads: usize, cli: &Cli) -> DirectQueuePolicy {
+    let bounded_threads = requested_threads.max(1);
+    let output_queue_capacity = if bounded_threads <= 32 {
+        8
+    } else if bounded_threads <= 64 {
+        16
+    } else if bounded_threads <= 128 {
+        32
+    } else {
+        64
+    };
+    let reader_queue_capacity = if bounded_threads <= 64 {
+        if cli.direct_reader_chunk_groups >= 1024 {
+            4
+        } else {
+            8
+        }
+    } else if cli.direct_reader_chunk_groups >= 1024 {
+        8
+    } else {
+        16
+    };
+    DirectQueuePolicy {
+        output_queue_capacity,
+        reader_queue_capacity,
+        reader_chunk_groups: cli.direct_reader_chunk_groups,
+        batch_size: cli.direct_batch_size,
     }
 }
 
