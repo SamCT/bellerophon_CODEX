@@ -984,21 +984,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
     } else {
         0.0
     };
-    let compute_to_writer_queue_occupancy_mean =
-        if compute_stats.compute_to_writer_queue_occupancy_samples > 0 {
-            compute_stats.compute_to_writer_queue_occupancy_sum as f64
-                / compute_stats.compute_to_writer_queue_occupancy_samples as f64
-        } else {
-            0.0
-        };
     stage_log(
         cli,
         format!(
-            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} input_to_compute_queue_max_depth={} input_to_compute_queue_capacity={} compute_to_writer_queue_max_depth={} compute_to_writer_queue_capacity={} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} input_to_compute_queue_full_events={} compute_to_writer_queue_full_events={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} compute_to_writer_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
+            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} input_to_compute_queue_max_depth={} input_to_compute_queue_capacity={} compute_to_writer_queue_capacity={} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} input_to_compute_queue_full_events={} compute_to_writer_queue_full_events={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
             writer_recv_wait_seconds,
             max_queue_depth,
             queue_policy.output_queue_capacity,
-            max_compute_output_queue_depth,
             queue_policy.output_queue_capacity,
             max_queue_depth,
             queue_policy.output_queue_capacity,
@@ -1038,7 +1030,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
             average_chunk_groups,
             max_chunk_groups,
             reader_chunk_queue_occupancy_mean,
-            compute_to_writer_queue_occupancy_mean,
             forward_reader_stats.chunks_sent,
             reverse_reader_stats.chunks_sent,
             queue_policy.output_queue_capacity,
