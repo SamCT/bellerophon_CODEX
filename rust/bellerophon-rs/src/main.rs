@@ -8,7 +8,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
 use tempfile::Builder;
@@ -128,7 +127,6 @@ struct DirectOutputBatch {
     records: Vec<(Record, Record)>,
     stats: DirectBatchStats,
     process_seconds: f64,
-    worker_threads_used: usize,
 }
 
 #[derive(Debug)]
@@ -499,7 +497,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let mut batches_processed: u64 = 0;
     let mut total_batch_size: u64 = 0;
     let mut max_batch_size: usize = 0;
-    let mut max_compute_workers_used: usize = 0;
 
     let mut forward_pending = None;
     let mut reverse_pending = None;
@@ -540,7 +537,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     flush_direct_batch(
                         &mut active_batch,
                         cli.quality,
-                        thread_resolution.compute_workers,
                         &mut output,
                         &mut stats,
                         &mut process_seconds,
@@ -549,7 +545,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
                         &mut total_batch_size,
                         &mut max_batch_size,
                         &mut batch_enqueue_wait_seconds,
-                        &mut max_compute_workers_used,
                     )?;
                 }
             }
@@ -558,7 +553,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     flush_direct_batch(
                         &mut active_batch,
                         cli.quality,
-                        thread_resolution.compute_workers,
                         &mut output,
                         &mut stats,
                         &mut process_seconds,
@@ -567,7 +561,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
                         &mut total_batch_size,
                         &mut max_batch_size,
                         &mut batch_enqueue_wait_seconds,
-                        &mut max_compute_workers_used,
                     )?;
                 }
                 break;
@@ -628,21 +621,14 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} max_queue_depth={} producer_blocked_seconds={:.6} writer_idle_seconds={:.6} batches_processed={} average_batch_size={:.3} max_batch_size={} compute_workers_assigned={} compute_workers_observed={} compute_worker_utilization_ratio={:.3}",
+            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} max_queue_depth={} producer_blocked_seconds={:.6} writer_idle_seconds={:.6} batches_processed={} average_batch_size={:.3} max_batch_size={}",
             writer_wait_for_sequence_seconds,
             max_queue_depth,
             producer_blocked_seconds,
             writer_idle_seconds,
             batches_processed,
             average_batch_size,
-            max_batch_size,
-            thread_resolution.compute_workers,
-            max_compute_workers_used,
-            if thread_resolution.compute_workers > 0 {
-                max_compute_workers_used as f64 / thread_resolution.compute_workers as f64
-            } else {
-                0.0
-            }
+            max_batch_size
         ),
     );
 
@@ -669,7 +655,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
 fn flush_direct_batch(
     active_batch: &mut Vec<(DirectRecordGroup, DirectRecordGroup)>,
     quality: u8,
-    compute_workers: usize,
     output: &mut Writer,
     stats: &mut PairFilterStats,
     process_seconds: &mut f64,
@@ -678,7 +663,6 @@ fn flush_direct_batch(
     total_batch_size: &mut u64,
     max_batch_size: &mut usize,
     batch_enqueue_wait_seconds: &mut f64,
-    max_compute_workers_used: &mut usize,
 ) -> Result<()> {
     if active_batch.is_empty() {
         return Ok(());
@@ -689,7 +673,7 @@ fn flush_direct_batch(
         groups: std::mem::replace(active_batch, Vec::with_capacity(1024)),
     };
     *batch_enqueue_wait_seconds += enqueue_start.elapsed().as_secs_f64();
-    let output_batch = process_direct_batch(batch, quality, compute_workers);
+    let output_batch = process_direct_batch(batch, quality);
     *process_seconds += output_batch.process_seconds;
     stats.groups += output_batch.stats.groups;
     stats.candidate_groups_fwd += output_batch.stats.candidate_groups_fwd;
@@ -711,15 +695,10 @@ fn flush_direct_batch(
     *batches_processed += 1;
     *total_batch_size += batch_size as u64;
     *max_batch_size = (*max_batch_size).max(batch_size);
-    *max_compute_workers_used = (*max_compute_workers_used).max(output_batch.worker_threads_used);
     Ok(())
 }
 
-fn process_direct_batch(
-    batch: DirectInputBatch,
-    quality: u8,
-    _compute_workers: usize,
-) -> DirectOutputBatch {
+fn process_direct_batch(batch: DirectInputBatch, quality: u8) -> DirectOutputBatch {
     let process_start = Instant::now();
     let mut results = Vec::with_capacity(batch.groups.len());
     for (f_group, r_group) in batch.groups {
@@ -739,12 +718,10 @@ fn process_direct_batch(
             selected.push(pair);
         }
     }
-    let worker_threads_used = usize::from(!selected.is_empty());
     DirectOutputBatch {
         records: selected,
         stats,
         process_seconds: process_start.elapsed().as_secs_f64(),
-        worker_threads_used,
     }
 }
 
