@@ -7,7 +7,6 @@ use rust_htslib::tpool::ThreadPool;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::thread;
 use std::time::Instant;
 use tempfile::Builder;
@@ -484,8 +483,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
     );
 
     let mut stats = PairFilterStats::default();
+    let read_match_start = Instant::now();
     let mut read_decode_seconds = 0.0f64;
-    let mut qname_group_seconds = 0.0f64;
     let mut pair_match_assembly_seconds = 0.0f64;
     let mut process_seconds = 0.0f64;
     let mut writer_drain_seconds = 0.0f64;
@@ -505,8 +504,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let mut active_batch: Vec<(DirectRecordGroup, DirectRecordGroup)> = Vec::with_capacity(1024);
 
     loop {
-        let group_read_start = Instant::now();
-        let read_decode_before = read_decode_seconds;
         let next_forward = next_group_records_read(
             &mut forward_reader,
             &mut forward_pending,
@@ -519,8 +516,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
             &mut reverse_record,
             &mut read_decode_seconds,
         )?;
-        qname_group_seconds +=
-            group_read_start.elapsed().as_secs_f64() - (read_decode_seconds - read_decode_before);
         let match_start = Instant::now();
         match (next_forward, next_reverse) {
             (Some(f_group), Some(r_group)) => {
@@ -569,8 +564,9 @@ fn run_direct(cli: &Cli) -> Result<()> {
         }
         pair_match_assembly_seconds += match_start.elapsed().as_secs_f64();
     }
-    let read_match_seconds =
-        read_decode_seconds + qname_group_seconds + pair_match_assembly_seconds;
+    let read_match_seconds = read_match_start.elapsed().as_secs_f64();
+    let qname_group_seconds =
+        (read_match_seconds - read_decode_seconds - pair_match_assembly_seconds).max(0.0);
     if writer_drain_seconds > process_seconds && stats.final_pairs > 0 {
         stage_log(
             cli,
