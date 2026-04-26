@@ -204,6 +204,7 @@ struct DirectWorkerStats {
     writer_periodic_flush_count: u64,
     writer_periodic_flush_seconds: f64,
     writer_pre_close_flush_seconds: f64,
+    total_output_drain_seconds: f64,
     output_bytes_before_close: u64,
     output_bytes_after_close: u64,
     records_written_before_close: u64,
@@ -219,10 +220,111 @@ struct DirectWriterRuntimeConfig {
     flow_stale_progress_micros: u64,
     flow_wait_poll_micros: u64,
     drain_min_interval_micros: u64,
-    drain_base_bytes: u64,
-    drain_backlog_trigger_batches: u64,
+    drain_min_base_bytes: u64,
+    drain_bytes_per_probe_second: u64,
     drain_expensive_threshold_micros: u64,
     drain_backoff_shift_max: u8,
+}
+
+#[derive(Clone, Debug)]
+struct OutputDrainController {
+    last_probe_instant: Instant,
+    last_probe_estimated_uncompressed_bytes: u64,
+    next_probe_estimated_uncompressed_bytes: u64,
+    expensive_backoff_shift: u8,
+    drain_duration_ema_seconds: f64,
+}
+
+impl OutputDrainController {
+    fn new(initial_probe_bytes: u64) -> Self {
+        Self {
+            last_probe_instant: Instant::now(),
+            last_probe_estimated_uncompressed_bytes: 0,
+            next_probe_estimated_uncompressed_bytes: initial_probe_bytes,
+            expensive_backoff_shift: 0,
+            drain_duration_ema_seconds: 0.0,
+        }
+    }
+
+    fn should_probe(
+        &self,
+        estimated_uncompressed_bytes: u64,
+        writer_bps: u64,
+        pending_batches: usize,
+        runtime_config: &DirectWriterRuntimeConfig,
+    ) -> bool {
+        if estimated_uncompressed_bytes < self.next_probe_estimated_uncompressed_bytes {
+            return false;
+        }
+        let elapsed_micros = self
+            .last_probe_instant
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        if elapsed_micros < runtime_config.drain_min_interval_micros {
+            return false;
+        }
+        let backlog_evidence_batches = (pending_batches as u64).saturating_mul(8);
+        if backlog_evidence_batches > runtime_config.flow_max_queue_backlog_batches {
+            return true;
+        }
+        let probe_period_seconds = (self.drain_duration_ema_seconds * 8.0).max(20.0).min(240.0);
+        let throughput_scaled_bytes = writer_bps.saturating_mul(probe_period_seconds as u64);
+        let bytes_since_last_probe = estimated_uncompressed_bytes
+            .saturating_sub(self.last_probe_estimated_uncompressed_bytes);
+        let dynamic_probe_floor = runtime_config
+            .drain_min_base_bytes
+            .max(throughput_scaled_bytes)
+            .max(
+                runtime_config
+                    .drain_min_base_bytes
+                    .saturating_mul(backlog_evidence_batches + 1),
+            );
+        bytes_since_last_probe >= dynamic_probe_floor
+    }
+
+    fn on_probe(
+        &mut self,
+        estimated_uncompressed_bytes: u64,
+        probe_micros: u64,
+        writer_bps: u64,
+        runtime_config: &DirectWriterRuntimeConfig,
+    ) {
+        let probe_seconds = probe_micros as f64 / 1e6f64;
+        if self.drain_duration_ema_seconds == 0.0 {
+            self.drain_duration_ema_seconds = probe_seconds;
+        } else {
+            self.drain_duration_ema_seconds =
+                (self.drain_duration_ema_seconds * 0.8) + (probe_seconds * 0.2);
+        }
+        if probe_micros >= runtime_config.drain_expensive_threshold_micros {
+            self.expensive_backoff_shift = self
+                .expensive_backoff_shift
+                .saturating_add(1)
+                .min(runtime_config.drain_backoff_shift_max);
+        } else if self.expensive_backoff_shift > 0 {
+            self.expensive_backoff_shift -= 1;
+        }
+        let ema_scaled_seconds = (self.drain_duration_ema_seconds * 12.0)
+            .max(20.0)
+            .min(480.0) as u64;
+        let throughput_scaled_bytes = writer_bps.saturating_mul(ema_scaled_seconds);
+        let base_next_probe = runtime_config
+            .drain_min_base_bytes
+            .max(throughput_scaled_bytes)
+            .max(
+                runtime_config
+                    .drain_bytes_per_probe_second
+                    .saturating_mul(ema_scaled_seconds),
+            );
+        let shifted_probe = base_next_probe
+            .checked_shl(self.expensive_backoff_shift as u32)
+            .unwrap_or(u64::MAX);
+        self.next_probe_estimated_uncompressed_bytes = estimated_uncompressed_bytes
+            .saturating_add(shifted_probe.max(runtime_config.drain_min_base_bytes));
+        self.last_probe_estimated_uncompressed_bytes = estimated_uncompressed_bytes;
+        self.last_probe_instant = Instant::now();
+    }
 }
 
 #[derive(Default, Clone, Debug)]
@@ -792,7 +894,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} writer_drain_min_interval_micros={} writer_drain_base_bytes={} writer_drain_backlog_trigger_batches={} flow_target_backlog_seconds={:.3} flow_min_inflight_bytes={} flow_max_inflight_bytes={} flow_max_queue_backlog_batches={} reader_mode={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_queue_policy=auto_bounded",
+            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} writer_drain_min_interval_micros={} writer_drain_min_base_bytes={} writer_drain_bytes_per_probe_second={} flow_target_backlog_seconds={:.3} flow_min_inflight_bytes={} flow_max_inflight_bytes={} flow_max_queue_backlog_batches={} reader_mode={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_queue_policy=auto_bounded",
             setup_start.elapsed().as_secs_f64(),
             thread_resolution.total_bgzf_workers,
             thread_resolution.compute_workers,
@@ -806,8 +908,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
             split_workers.reverse,
             split_workers.output,
             writer_runtime_config.drain_min_interval_micros,
-            writer_runtime_config.drain_base_bytes,
-            writer_runtime_config.drain_backlog_trigger_batches,
+            writer_runtime_config.drain_min_base_bytes,
+            writer_runtime_config.drain_bytes_per_probe_second,
             writer_runtime_config.flow_target_backlog_seconds,
             writer_runtime_config.flow_min_inflight_bytes,
             writer_runtime_config.flow_max_inflight_bytes,
@@ -1326,14 +1428,20 @@ fn run_direct(cli: &Cli) -> Result<()> {
     } else {
         "close_time_not_dominant"
     };
+    let total_output_drain_seconds = writer_stats.writer_periodic_flush_seconds
+        + writer_stats.writer_pre_close_flush_seconds
+        + writer_stats.hts_close_seconds
+        + shared_pool_drop_seconds
+        + output_pool_drop_seconds;
     stage_log(
         cli,
         format!(
-            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
+            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} total_output_drain_seconds={:.6} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} estimated_uncompressed_bytes_written={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
             write_call_seconds,
             writer_stats.hts_close_seconds,
             close_to_write_ratio,
             close_note,
+            total_output_drain_seconds,
             writer_stats.writer_periodic_flush_count,
             writer_stats.writer_periodic_flush_seconds,
             writer_stats.writer_pre_close_flush_seconds,
@@ -1344,6 +1452,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_stats
                 .output_bytes_after_close
                 .saturating_sub(writer_stats.output_bytes_before_close),
+            writer_stats.estimated_uncompressed_bytes_written,
             shared_pool_drop_seconds,
             output_pool_drop_seconds
         ),
@@ -1367,10 +1476,17 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_summary requested_threads={} read_match_seconds={:.6} hts_close_seconds={:.6} total_pipeline_seconds={:.6} records_written={} output_mb={:.3} reader_decode_wall_seconds={:.6} compute_filter_wall_seconds={:.6} ordered_writer_write_seconds={:.6} ordered_writer_wait_for_next_batch_seconds={:.6} writer_actual_bam_write_seconds={:.6}",
+            "STAGE direct_summary requested_threads={} read_match_seconds={:.6} total_output_drain_seconds={:.6} writer_periodic_flush_seconds={:.6} writer_periodic_flush_count={} writer_pre_close_flush_seconds={:.6} hts_close_seconds={:.6} output_bytes_before_close={} output_bytes_after_close={} estimated_uncompressed_bytes_written={} total_pipeline_seconds={:.6} records_written={} output_mb={:.3} reader_decode_wall_seconds={:.6} compute_filter_wall_seconds={:.6} ordered_writer_write_seconds={:.6} ordered_writer_wait_for_next_batch_seconds={:.6} writer_actual_bam_write_seconds={:.6}",
             thread_resolution.requested_threads,
             read_match_seconds,
+            total_output_drain_seconds,
+            writer_stats.writer_periodic_flush_seconds,
+            writer_stats.writer_periodic_flush_count,
+            writer_stats.writer_pre_close_flush_seconds,
             writer_stats.hts_close_seconds,
+            writer_stats.output_bytes_before_close,
+            writer_stats.output_bytes_after_close,
+            writer_stats.estimated_uncompressed_bytes_written,
             read_match_seconds + writer_drain_seconds,
             writer_stats.records_written,
             size_mb(&cli.output)?,
@@ -2063,9 +2179,7 @@ fn direct_writer_thread(
     let mut next_batch_id = 0u64;
     let mut pending: BTreeMap<u64, DirectOutputBatch> = BTreeMap::new();
     let mut waiting_for_batch_counts: HashMap<u64, u64> = HashMap::new();
-    let mut bytes_since_checkpoint = 0u64;
-    let mut last_checkpoint = Instant::now();
-    let mut drain_backoff_shift = 0u8;
+    let mut drain_controller = OutputDrainController::new(runtime_config.drain_min_base_bytes);
     loop {
         let recv_wait_start = Instant::now();
         let output_batch = match batch_receiver.recv() {
@@ -2140,31 +2254,13 @@ fn direct_writer_thread(
                 };
                 writer_bytes_per_second_estimate.store(next_bps, Ordering::Relaxed);
             }
-            bytes_since_checkpoint = bytes_since_checkpoint.saturating_add(batch_bytes_written);
             let writer_bps = writer_bytes_per_second_estimate.load(Ordering::Relaxed);
-            let dynamic_target_bytes = if writer_bps == 0 {
-                runtime_config.drain_base_bytes
-            } else {
-                ((writer_bps as f64) * runtime_config.flow_target_backlog_seconds) as u64
-            }
-            .clamp(
-                runtime_config.drain_base_bytes,
-                runtime_config.flow_max_inflight_bytes,
-            );
-            let drain_target_bytes = dynamic_target_bytes
-                .checked_shl(drain_backoff_shift as u32)
-                .unwrap_or(u64::MAX)
-                .min(runtime_config.flow_max_inflight_bytes);
-            let elapsed_since_checkpoint_micros = last_checkpoint
-                .elapsed()
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64;
-            let should_checkpoint = bytes_since_checkpoint >= drain_target_bytes
-                && elapsed_since_checkpoint_micros >= runtime_config.drain_min_interval_micros
-                || pending.len() as u64 >= runtime_config.drain_backlog_trigger_batches
-                    && elapsed_since_checkpoint_micros
-                        >= runtime_config.drain_min_interval_micros / 2;
-            if should_checkpoint {
+            if drain_controller.should_probe(
+                worker_stats.estimated_uncompressed_bytes_written,
+                writer_bps,
+                pending.len(),
+                &runtime_config,
+            ) {
                 let checkpoint_start = Instant::now();
                 // rust-htslib::bam::Writer does not expose a flush API in rust-htslib 0.51.0.
                 // Keep periodic diagnostics by sampling observable on-disk progress instead.
@@ -2177,15 +2273,12 @@ fn direct_writer_thread(
                     .min(u128::from(u64::MAX)) as u64;
                 worker_stats.writer_periodic_flush_seconds += checkpoint_micros as f64 / 1e6f64;
                 worker_stats.writer_periodic_flush_count += 1;
-                if checkpoint_micros >= runtime_config.drain_expensive_threshold_micros {
-                    drain_backoff_shift = drain_backoff_shift
-                        .saturating_add(1)
-                        .min(runtime_config.drain_backoff_shift_max);
-                } else if drain_backoff_shift > 0 {
-                    drain_backoff_shift -= 1;
-                }
-                bytes_since_checkpoint = 0;
-                last_checkpoint = Instant::now();
+                drain_controller.on_probe(
+                    worker_stats.estimated_uncompressed_bytes_written,
+                    checkpoint_micros,
+                    writer_bps,
+                    &runtime_config,
+                );
             }
             next_batch_id += 1;
             ordered_writer_next_expected_batch_id.store(next_batch_id, Ordering::Relaxed);
@@ -2227,6 +2320,9 @@ fn direct_writer_thread(
     let sync_start = Instant::now();
     worker_stats.file_sync_or_drop_seconds = sync_start.elapsed().as_secs_f64();
     worker_stats.bgzf_flush_seconds = 0.0;
+    worker_stats.total_output_drain_seconds = worker_stats.writer_periodic_flush_seconds
+        + worker_stats.writer_pre_close_flush_seconds
+        + worker_stats.hts_close_seconds;
     Ok(worker_stats)
 }
 
@@ -2985,16 +3081,17 @@ fn resolve_direct_writer_runtime_config(
     let flow_stale_progress_micros = 100_000;
     let flow_wait_poll_micros = 75;
     let drain_min_interval_micros = if bounded_threads >= 64 {
-        2_500_000
+        10_000_000
     } else {
-        4_000_000
+        15_000_000
     };
-    let drain_base_bytes = (64 * 1024 * 1024u64)
-        .saturating_mul(writer_workers.min(8))
-        .min(flow_max_inflight_bytes);
-    let drain_backlog_trigger_batches = (writer_workers * 4).clamp(6, 48);
-    let drain_expensive_threshold_micros = 250_000;
-    let drain_backoff_shift_max = 4;
+    let drain_min_base_bytes = (1024 * 1024 * 1024u64)
+        .saturating_mul(writer_workers.min(4))
+        .max(flow_max_inflight_bytes.saturating_mul(2));
+    let drain_bytes_per_probe_second =
+        (128 * 1024 * 1024u64).saturating_mul(writer_workers.max(1).min(8));
+    let drain_expensive_threshold_micros = 1_000_000;
+    let drain_backoff_shift_max = 6;
     DirectWriterRuntimeConfig {
         flow_target_backlog_seconds,
         flow_min_inflight_bytes,
@@ -3003,8 +3100,8 @@ fn resolve_direct_writer_runtime_config(
         flow_stale_progress_micros,
         flow_wait_poll_micros,
         drain_min_interval_micros,
-        drain_base_bytes,
-        drain_backlog_trigger_batches,
+        drain_min_base_bytes,
+        drain_bytes_per_probe_second,
         drain_expensive_threshold_micros,
         drain_backoff_shift_max,
     }
