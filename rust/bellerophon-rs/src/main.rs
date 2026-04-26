@@ -48,7 +48,7 @@ struct Cli {
     compression_level: Option<u8>,
     #[arg(short = 'l', long = "log-level", default_value = "error")]
     log_level: LogLevel,
-    #[arg(long = "pipeline", value_enum)]
+    #[arg(long = "pipeline", value_enum, default_value = "direct", hide = true)]
     pipeline: Pipeline,
     #[arg(long = "tmp-dir", default_value = ".")]
     tmp_dir: PathBuf,

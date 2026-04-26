@@ -19,11 +19,19 @@ cargo fmt --manifest-path rust/bellerophon-rs/Cargo.toml
 cargo test --manifest-path rust/bellerophon-rs/Cargo.toml
 ```
 
-## Pipeline support
+## CLI usage
 
-- `--pipeline legacy-temp`: mirrors Python temp-BAM flow.
-- `--pipeline pair-temp`: pair-aware filter, temp BAM only for surviving pairs.
-- `--pipeline direct`: pair-aware filter, writes final BAM directly.
+Normal CLI usage runs the direct implementation by default (no pipeline selection required):
+
+```bash
+target/release/bellerophon-rs \
+  --forward R1.bam \
+  --reverse R2.bam \
+  --output out.bam \
+  --quality 20 \
+  --threads 32 \
+  --log-level info
+```
 
 ## Direct mode thread model
 
@@ -45,7 +53,6 @@ Use even thread counts and focus on thread-scaling effects:
 for t in 16 32 64 128; do
   /usr/bin/time -f "threads=${t} elapsed=%e" \
     target/release/bellerophon-rs \
-    --pipeline direct \
     --forward /scratch/forward.bam \
     --reverse /scratch/reverse.bam \
     --output /scratch/out.t${t}.bam \

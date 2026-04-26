@@ -9,7 +9,7 @@ RUNNER_PIPELINE = {
     'python': '',
     'rust_legacy_temp': 'legacy-temp',
     'rust_pair_temp': 'pair-temp',
-    'rust_direct': 'direct',
+    'rust_direct': '',
 }
 
 
@@ -59,11 +59,11 @@ def build_inner_command(args, runner, strategy, quality, thread_count, run_dir, 
             str(thread_count),
             '--log-level',
             'info',
-            '--pipeline',
-            RUNNER_PIPELINE[runner],
             '--tmp-dir',
             run_dir,
         ]
+        if RUNNER_PIPELINE[runner]:
+            matrix_cmd.extend(['--pipeline', RUNNER_PIPELINE[runner]])
 
     return (
         'mkdir -p {run_dir} && '

@@ -10,7 +10,7 @@ RUNNER_PIPELINE = {
     'python': None,
     'rust_legacy_temp': 'legacy-temp',
     'rust_pair_temp': 'pair-temp',
-    'rust_direct': 'direct',
+    'rust_direct': None,
 }
 
 
@@ -74,11 +74,11 @@ def run_one(args, runner, strategy, quality, threads, base_dir):
             str(threads),
             '--log-level',
             'info',
-            '--pipeline',
-            RUNNER_PIPELINE[runner],
             '--tmp-dir',
             run_dir,
         ]
+        if RUNNER_PIPELINE[runner] is not None:
+            cmd.extend(['--pipeline', RUNNER_PIPELINE[runner]])
 
     with open(log_txt, 'w', encoding='utf-8') as log_fh:
         subprocess.run(cmd, check=True, env=env, stdout=log_fh, stderr=subprocess.STDOUT)
