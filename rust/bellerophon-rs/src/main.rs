@@ -205,8 +205,6 @@ struct DirectComputeStats {
     compute_input_wait_seconds: f64,
     compute_output_send_wait_seconds: f64,
     compute_output_queue_full_events: u64,
-    compute_to_writer_queue_occupancy_sum: u64,
-    compute_to_writer_queue_occupancy_samples: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -640,34 +638,18 @@ fn run_direct(cli: &Cli) -> Result<()> {
         sync_channel::<DirectOutputBatch>(queue_policy.output_queue_capacity);
     let input_queue_depth = Arc::new(AtomicUsize::new(0));
     let input_queue_max_depth = Arc::new(AtomicUsize::new(0));
-    let output_queue_depth = Arc::new(AtomicUsize::new(0));
-    let output_queue_max_depth = Arc::new(AtomicUsize::new(0));
     let input_batch_receiver = Arc::new(Mutex::new(input_batch_receiver));
     let mut compute_handles = Vec::with_capacity(thread_resolution.compute_workers);
     for _ in 0..thread_resolution.compute_workers {
         let worker_receiver = Arc::clone(&input_batch_receiver);
         let worker_sender = output_batch_sender.clone();
         let worker_quality = cli.quality;
-        let worker_input_queue_depth = Arc::clone(&input_queue_depth);
-        let worker_output_queue_depth = Arc::clone(&output_queue_depth);
-        let worker_output_queue_max_depth = Arc::clone(&output_queue_max_depth);
         compute_handles.push(thread::spawn(move || {
-            direct_compute_thread(
-                worker_receiver,
-                worker_sender,
-                worker_quality,
-                worker_input_queue_depth,
-                worker_output_queue_depth,
-                worker_output_queue_max_depth,
-                queue_policy.output_queue_capacity,
-            )
+            direct_compute_thread(worker_receiver, worker_sender, worker_quality)
         }));
     }
     drop(output_batch_sender);
-    let writer_handle = thread::spawn({
-        let writer_output_queue_depth = Arc::clone(&output_queue_depth);
-        move || direct_writer_thread(output_batch_receiver, output, writer_output_queue_depth)
-    });
+    let writer_handle = thread::spawn(move || direct_writer_thread(output_batch_receiver, output));
 
     stage_log(
         cli,
@@ -862,13 +844,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
         compute_workers: thread_resolution.compute_workers,
         ..Default::default()
     };
-    let mut compute_batches_by_worker: Vec<u64> =
-        Vec::with_capacity(thread_resolution.compute_workers);
     for handle in compute_handles {
         let worker_stats = handle
             .join()
             .map_err(|_| anyhow::anyhow!("direct compute thread panicked"))??;
-        compute_batches_by_worker.push(worker_stats.compute_batches_processed);
         compute_stats.compute_batches_processed += worker_stats.compute_batches_processed;
         compute_stats.compute_records_selected += worker_stats.compute_records_selected;
         compute_stats.compute_filter_seconds_total += worker_stats.compute_filter_seconds_total;
@@ -877,10 +856,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
             worker_stats.compute_output_send_wait_seconds;
         compute_stats.compute_output_queue_full_events +=
             worker_stats.compute_output_queue_full_events;
-        compute_stats.compute_to_writer_queue_occupancy_sum +=
-            worker_stats.compute_to_writer_queue_occupancy_sum;
-        compute_stats.compute_to_writer_queue_occupancy_samples +=
-            worker_stats.compute_to_writer_queue_occupancy_samples;
         compute_stats.compute_filter_wall_seconds = compute_stats
             .compute_filter_wall_seconds
             .max(worker_stats.compute_filter_wall_seconds);
@@ -974,8 +949,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_drain_seconds
         ),
     );
-    let max_queue_depth = input_queue_max_depth.load(Ordering::Relaxed);
-    let max_compute_output_queue_depth = output_queue_max_depth.load(Ordering::Relaxed);
+    let max_queue_depth = input_queue_max_depth.load(Ordering::Relaxed).max(1);
     let average_batch_size = if batches_processed > 0 {
         total_batch_size as f64 / batches_processed as f64
     } else {
@@ -1076,14 +1050,9 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_compute_diagnostics compute_workers={} compute_batches_processed={} compute_batches_by_worker={} compute_records_selected={} compute_filter_seconds_total={:.6} compute_filter_wall_seconds={:.6} compute_input_wait_seconds={:.6} compute_output_send_wait_seconds={:.6} compute_output_queue_full_events={} ordered_writer_pending_batches_max={} ordered_writer_wait_for_next_batch_seconds={:.6} ordered_writer_write_seconds={:.6} ordered_writer_records_per_second={:.3}",
+            "STAGE direct_compute_diagnostics compute_workers={} compute_batches_processed={} compute_records_selected={} compute_filter_seconds_total={:.6} compute_filter_wall_seconds={:.6} compute_input_wait_seconds={:.6} compute_output_send_wait_seconds={:.6} compute_output_queue_full_events={} ordered_writer_pending_batches_max={} ordered_writer_wait_for_next_batch_seconds={:.6} ordered_writer_write_seconds={:.6} ordered_writer_records_per_second={:.3}",
             compute_stats.compute_workers,
             compute_stats.compute_batches_processed,
-            compute_batches_by_worker
-                .iter()
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
             compute_stats.compute_records_selected,
             compute_stats.compute_filter_seconds_total,
             compute_stats.compute_filter_wall_seconds,
@@ -1540,10 +1509,6 @@ fn direct_compute_thread(
     batch_receiver: Arc<Mutex<Receiver<DirectInputBatch>>>,
     output_sender: SyncSender<DirectOutputBatch>,
     quality: u8,
-    input_queue_depth: Arc<AtomicUsize>,
-    output_queue_depth: Arc<AtomicUsize>,
-    output_queue_max_depth: Arc<AtomicUsize>,
-    output_queue_capacity: usize,
 ) -> Result<DirectComputeStats> {
     let worker_start = Instant::now();
     let mut stats = DirectComputeStats::default();
@@ -1558,34 +1523,15 @@ fn direct_compute_thread(
         match batch {
             Ok(batch) => {
                 stats.compute_input_wait_seconds += recv_wait_start.elapsed().as_secs_f64();
-                decrement_depth(&input_queue_depth);
                 stats.compute_batches_processed += 1;
                 let output_batch = process_direct_batch(batch, quality);
                 stats.compute_records_selected += (output_batch.records.len() * 2) as u64;
                 stats.compute_filter_seconds_total += output_batch.filter_seconds;
-                if output_queue_depth.load(Ordering::Relaxed) >= output_queue_capacity {
-                    stats.compute_output_queue_full_events += 1;
-                }
                 let send_wait_start = Instant::now();
                 if output_sender.send(output_batch).is_err() {
                     break;
                 }
                 stats.compute_output_send_wait_seconds += send_wait_start.elapsed().as_secs_f64();
-                let depth = output_queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-                stats.compute_to_writer_queue_occupancy_sum += depth as u64;
-                stats.compute_to_writer_queue_occupancy_samples += 1;
-                loop {
-                    let previous_max = output_queue_max_depth.load(Ordering::Relaxed);
-                    if depth <= previous_max {
-                        break;
-                    }
-                    if output_queue_max_depth
-                        .compare_exchange(previous_max, depth, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        break;
-                    }
-                }
             }
             Err(_) => break,
         }
@@ -1597,7 +1543,6 @@ fn direct_compute_thread(
 fn direct_writer_thread(
     batch_receiver: Receiver<DirectOutputBatch>,
     mut output: Writer,
-    output_queue_depth: Arc<AtomicUsize>,
 ) -> Result<DirectWorkerStats> {
     let writer_loop_start = Instant::now();
     let mut worker_stats = DirectWorkerStats::default();
@@ -1610,7 +1555,6 @@ fn direct_writer_thread(
             Err(_) => break,
         };
         worker_stats.writer_recv_wait_seconds += recv_wait_start.elapsed().as_secs_f64();
-        decrement_depth(&output_queue_depth);
         pending.insert(output_batch.batch_id, output_batch);
         worker_stats.ordered_writer_pending_batches_max = worker_stats
             .ordered_writer_pending_batches_max
