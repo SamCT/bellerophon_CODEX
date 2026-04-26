@@ -204,7 +204,6 @@ struct DirectWorkerStats {
     writer_periodic_flush_count: u64,
     writer_periodic_flush_seconds: f64,
     writer_pre_close_flush_seconds: f64,
-    total_output_drain_seconds: f64,
     output_bytes_before_close: u64,
     output_bytes_after_close: u64,
     records_written_before_close: u64,
@@ -2400,9 +2399,6 @@ fn direct_writer_thread(
     let sync_start = Instant::now();
     worker_stats.file_sync_or_drop_seconds = sync_start.elapsed().as_secs_f64();
     worker_stats.bgzf_flush_seconds = 0.0;
-    worker_stats.total_output_drain_seconds = worker_stats.writer_periodic_flush_seconds
-        + worker_stats.writer_pre_close_flush_seconds
-        + worker_stats.hts_close_seconds;
     Ok(worker_stats)
 }
 
