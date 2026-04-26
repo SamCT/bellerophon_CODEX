@@ -340,6 +340,76 @@ struct WriterDrainDiagnostics {
     max_ordered_backlog_batches: u64,
 }
 
+const UNSET_ELAPSED_MICROS: u64 = u64::MAX;
+
+#[derive(Debug)]
+struct PipelineLifecycleMarkers {
+    readers_started_micros: AtomicU64,
+    writer_thread_started_micros: AtomicU64,
+    first_input_batch_submitted_micros: AtomicU64,
+    first_output_batch_submitted_micros: AtomicU64,
+    first_writer_batch_received_micros: AtomicU64,
+    first_writer_batch_written_micros: AtomicU64,
+    last_input_batch_submitted_micros: AtomicU64,
+    producers_done_micros: AtomicU64,
+    compute_done_micros: AtomicU64,
+    output_senders_dropped_micros: AtomicU64,
+    writer_last_batch_received_micros: AtomicU64,
+    writer_last_batch_written_micros: AtomicU64,
+    writer_finalize_start_micros: AtomicU64,
+    writer_finalize_done_micros: AtomicU64,
+    writer_thread_exit_micros: AtomicU64,
+    writer_join_start_micros: AtomicU64,
+    writer_join_done_micros: AtomicU64,
+    pipeline_end_micros: AtomicU64,
+}
+
+impl Default for PipelineLifecycleMarkers {
+    fn default() -> Self {
+        Self {
+            readers_started_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            writer_thread_started_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            first_input_batch_submitted_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            first_output_batch_submitted_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            first_writer_batch_received_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            first_writer_batch_written_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            last_input_batch_submitted_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            producers_done_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            compute_done_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            output_senders_dropped_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            writer_last_batch_received_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            writer_last_batch_written_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            writer_finalize_start_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            writer_finalize_done_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            writer_thread_exit_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            writer_join_start_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            writer_join_done_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+            pipeline_end_micros: AtomicU64::new(UNSET_ELAPSED_MICROS),
+        }
+    }
+}
+
+fn mark_elapsed_once(target: &AtomicU64, pipeline_start: Instant) {
+    let elapsed = pipeline_start
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    let _ = target.compare_exchange(
+        UNSET_ELAPSED_MICROS,
+        elapsed,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+}
+
+fn elapsed_micros_to_seconds(value: u64) -> f64 {
+    if value == UNSET_ELAPSED_MICROS {
+        -1.0
+    } else {
+        value as f64 / 1_000_000.0
+    }
+}
+
 #[derive(Default, Clone, Debug)]
 struct OutputFlowStats {
     input_flow_control_wait_seconds: f64,
@@ -974,6 +1044,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let writer_bytes_per_second_estimate = Arc::new(AtomicU64::new(0));
     let writer_last_progress_micros = Arc::new(AtomicU64::new(0));
     let pipeline_start = Instant::now();
+    let lifecycle = Arc::new(PipelineLifecycleMarkers::default());
     let writer_runtime_config = resolve_direct_writer_runtime_config(
         thread_resolution.requested_threads,
         thread_resolution.shared_pool_intended_writer_bgzf_workers,
@@ -1001,6 +1072,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
         let worker_output_flow_controller = Arc::clone(&output_flow_controller);
         let worker_output_queue_capacity = queue_policy.output_queue_capacity;
         let worker_pipeline_start = pipeline_start;
+        let worker_lifecycle = Arc::clone(&lifecycle);
         compute_handles.push(thread::spawn(move || {
             direct_compute_thread(
                 worker_id,
@@ -1020,6 +1092,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 worker_output_queue_capacity,
                 worker_writer_runtime_config,
                 worker_pipeline_start,
+                worker_lifecycle,
             )
         }));
     }
@@ -1031,6 +1104,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let writer_next_expected_batch_id = Arc::clone(&ordered_writer_next_expected_batch_id);
     let writer_next_expected_batch_id_for_thread = Arc::clone(&writer_next_expected_batch_id);
     let writer_output_flow_controller = Arc::clone(&output_flow_controller);
+    let writer_lifecycle = Arc::clone(&lifecycle);
     let output_path_for_writer = cli.output.clone();
     let writer_handle = thread::spawn(move || {
         direct_writer_thread(
@@ -1045,6 +1119,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_output_flow_controller,
             writer_runtime_config,
             pipeline_start,
+            writer_lifecycle,
         )
     });
 
@@ -1080,6 +1155,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     );
 
     let read_match_start = Instant::now();
+    mark_elapsed_once(&lifecycle.readers_started_micros, pipeline_start);
     let mut forward_reader_stats = ReaderDecodeStats::default();
     let mut reverse_reader_stats = ReaderDecodeStats::default();
     let mut pair_match_assembly_seconds = 0.0f64;
@@ -1146,6 +1222,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     &mut next_batch_id,
                     &mut input_flow_control_wait_seconds,
                     &output_flow_controller,
+                    pipeline_start,
+                    &lifecycle,
                 )?;
                 if done {
                     break;
@@ -1216,6 +1294,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 &mut next_batch_id,
                 &mut input_flow_control_wait_seconds,
                 &output_flow_controller,
+                pipeline_start,
+                &lifecycle,
             )?;
             forward_reader_stats = forward_handle
                 .join()
@@ -1252,6 +1332,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let input_batches_submitted = next_batch_id;
     drop(input_batch_sender);
     output_flow_controller.on_producers_done();
+    mark_elapsed_once(&lifecycle.producers_done_micros, pipeline_start);
     let producer_done_flow_snapshot = output_flow_controller.snapshot();
     stage_log(
         cli,
@@ -1317,6 +1398,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
             .compute_filter_wall_seconds
             .max(worker_stats.compute_filter_wall_seconds);
     }
+    mark_elapsed_once(&lifecycle.compute_done_micros, pipeline_start);
+    mark_elapsed_once(&lifecycle.output_senders_dropped_micros, pipeline_start);
     per_worker_stats.sort_by_key(|entry| entry.worker_id);
     compute_stats.per_worker_batches_processed = per_worker_stats
         .iter()
@@ -1396,9 +1479,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_runtime_config.flow_wait_poll_micros.max(250),
         ));
     }
+    mark_elapsed_once(&lifecycle.writer_join_start_micros, pipeline_start);
     let writer_stats = writer_handle
         .join()
         .map_err(|_| anyhow::anyhow!("direct writer thread panicked"))??;
+    mark_elapsed_once(&lifecycle.writer_join_done_micros, pipeline_start);
     let writer_drain_seconds = writer_wait_start.elapsed().as_secs_f64();
     let output_flow_snapshot = output_flow_controller.snapshot();
     stage_log(
@@ -1750,6 +1835,118 @@ fn run_direct(cli: &Cli) -> Result<()> {
             parts[0].0
         }
     };
+    let pipeline_start_elapsed = 0.0f64;
+    let readers_started_elapsed =
+        elapsed_micros_to_seconds(lifecycle.readers_started_micros.load(Ordering::Relaxed));
+    let writer_thread_started_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .writer_thread_started_micros
+            .load(Ordering::Relaxed),
+    );
+    let first_input_batch_submitted_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .first_input_batch_submitted_micros
+            .load(Ordering::Relaxed),
+    );
+    let first_output_batch_submitted_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .first_output_batch_submitted_micros
+            .load(Ordering::Relaxed),
+    );
+    let first_writer_batch_received_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .first_writer_batch_received_micros
+            .load(Ordering::Relaxed),
+    );
+    let first_writer_batch_written_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .first_writer_batch_written_micros
+            .load(Ordering::Relaxed),
+    );
+    let last_input_batch_submitted_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .last_input_batch_submitted_micros
+            .load(Ordering::Relaxed),
+    );
+    let producers_done_elapsed =
+        elapsed_micros_to_seconds(lifecycle.producers_done_micros.load(Ordering::Relaxed));
+    let compute_done_elapsed =
+        elapsed_micros_to_seconds(lifecycle.compute_done_micros.load(Ordering::Relaxed));
+    let output_senders_dropped_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .output_senders_dropped_micros
+            .load(Ordering::Relaxed),
+    );
+    let writer_last_batch_received_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .writer_last_batch_received_micros
+            .load(Ordering::Relaxed),
+    );
+    let writer_last_batch_written_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .writer_last_batch_written_micros
+            .load(Ordering::Relaxed),
+    );
+    let writer_finalize_start_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .writer_finalize_start_micros
+            .load(Ordering::Relaxed),
+    );
+    let writer_finalize_done_elapsed = elapsed_micros_to_seconds(
+        lifecycle
+            .writer_finalize_done_micros
+            .load(Ordering::Relaxed),
+    );
+    let writer_thread_exit_elapsed =
+        elapsed_micros_to_seconds(lifecycle.writer_thread_exit_micros.load(Ordering::Relaxed));
+    let writer_join_start_elapsed =
+        elapsed_micros_to_seconds(lifecycle.writer_join_start_micros.load(Ordering::Relaxed));
+    let writer_join_done_elapsed =
+        elapsed_micros_to_seconds(lifecycle.writer_join_done_micros.load(Ordering::Relaxed));
+    let producer_phase_seconds = producers_done_elapsed.max(0.0);
+    let compute_drain_after_producer_done_seconds =
+        (compute_done_elapsed - producers_done_elapsed).max(0.0);
+    let output_queue_drain_after_compute_done_seconds =
+        (writer_last_batch_received_elapsed - compute_done_elapsed).max(0.0);
+    let ordered_writer_drain_after_compute_done_seconds =
+        (writer_last_batch_written_elapsed - writer_last_batch_received_elapsed).max(0.0);
+    let writer_write_after_compute_done_seconds =
+        (writer_last_batch_written_elapsed - compute_done_elapsed).max(0.0);
+    let writer_finalize_seconds =
+        (writer_finalize_done_elapsed - writer_finalize_start_elapsed).max(0.0);
+    let writer_join_overhead_seconds =
+        (writer_join_done_elapsed - writer_join_start_elapsed - writer_drain_seconds).max(0.0);
+    let writer_tail_unclassified_seconds = (writer_drain_seconds
+        - compute_drain_after_producer_done_seconds
+        - output_queue_drain_after_compute_done_seconds
+        - ordered_writer_drain_after_compute_done_seconds
+        - writer_write_after_compute_done_seconds
+        - writer_finalize_seconds
+        - writer_join_overhead_seconds)
+        .max(0.0);
+    let writer_tail_accounting_error_seconds = writer_drain_seconds
+        - (compute_drain_after_producer_done_seconds
+            + output_queue_drain_after_compute_done_seconds
+            + ordered_writer_drain_after_compute_done_seconds
+            + writer_write_after_compute_done_seconds
+            + writer_finalize_seconds
+            + writer_join_overhead_seconds
+            + writer_tail_unclassified_seconds);
+    let writer_tail_primary_cause = writer_drain_primary_cause;
+    stage_log(
+        cli,
+        format!(
+            "STAGE direct_lifecycle_timestamps pipeline_start_elapsed={:.6} readers_started_elapsed={:.6} writer_thread_started_elapsed={:.6} first_input_batch_submitted_elapsed={:.6} first_output_batch_submitted_elapsed={:.6} first_writer_batch_received_elapsed={:.6} first_writer_batch_written_elapsed={:.6} last_input_batch_submitted_elapsed={:.6} producers_done_elapsed={:.6} compute_done_elapsed={:.6} output_senders_dropped_elapsed={:.6} writer_last_batch_received_elapsed={:.6} writer_last_batch_written_elapsed={:.6} writer_finalize_start_elapsed={:.6} writer_finalize_done_elapsed={:.6} writer_thread_exit_elapsed={:.6} writer_join_start_elapsed={:.6} writer_join_done_elapsed={:.6}",
+            pipeline_start_elapsed, readers_started_elapsed, writer_thread_started_elapsed, first_input_batch_submitted_elapsed, first_output_batch_submitted_elapsed, first_writer_batch_received_elapsed, first_writer_batch_written_elapsed, last_input_batch_submitted_elapsed, producers_done_elapsed, compute_done_elapsed, output_senders_dropped_elapsed, writer_last_batch_received_elapsed, writer_last_batch_written_elapsed, writer_finalize_start_elapsed, writer_finalize_done_elapsed, writer_thread_exit_elapsed, writer_join_start_elapsed, writer_join_done_elapsed
+        ),
+    );
+    stage_log(
+        cli,
+        format!(
+            "STAGE writer_tail_breakdown_exclusive producer_phase_seconds={:.6} compute_drain_after_producer_done_seconds={:.6} output_queue_drain_after_compute_done_seconds={:.6} ordered_writer_drain_after_compute_done_seconds={:.6} writer_write_after_compute_done_seconds={:.6} writer_finalize_seconds={:.6} writer_join_overhead_seconds={:.6} writer_tail_unclassified_seconds={:.6} end_to_end_seconds={:.6} writer_tail_accounting_error_seconds={:.6} writer_tail_primary_cause={}",
+            producer_phase_seconds, compute_drain_after_producer_done_seconds, output_queue_drain_after_compute_done_seconds, ordered_writer_drain_after_compute_done_seconds, writer_write_after_compute_done_seconds, writer_finalize_seconds, writer_join_overhead_seconds, writer_tail_unclassified_seconds, pipeline_start.elapsed().as_secs_f64(), writer_tail_accounting_error_seconds, writer_tail_primary_cause
+        ),
+    );
     stage_log(
         cli,
         format!(
@@ -1844,6 +2041,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             size_mb(&cli.output)?
         ),
     );
+    mark_elapsed_once(&lifecycle.pipeline_end_micros, pipeline_start);
     let end_to_end_seconds = pipeline_start.elapsed().as_secs_f64();
     stage_log(
         cli,
@@ -1906,6 +2104,8 @@ fn flush_direct_batch(
     next_batch_id: &mut u64,
     input_flow_control_wait_seconds: &mut f64,
     output_flow_controller: &Arc<OutputFlowController>,
+    pipeline_start: Instant,
+    lifecycle: &Arc<PipelineLifecycleMarkers>,
 ) -> Result<()> {
     if active_batch.is_empty() {
         return Ok(());
@@ -1917,6 +2117,12 @@ fn flush_direct_batch(
         *output_queue_full_events += 1;
     }
     let enqueue_start = Instant::now();
+    if *next_batch_id == 0 {
+        mark_elapsed_once(
+            &lifecycle.first_input_batch_submitted_micros,
+            pipeline_start,
+        );
+    }
     let batch = DirectInputBatch {
         batch_id: *next_batch_id,
         groups: std::mem::replace(active_batch, Vec::with_capacity(direct_batch_size)),
@@ -1926,6 +2132,13 @@ fn flush_direct_batch(
         .send(batch)
         .context("failed to send direct batch to writer thread")?;
     let depth = queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+    lifecycle.last_input_batch_submitted_micros.store(
+        pipeline_start
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
     loop {
         let previous_max = max_queue_depth.load(Ordering::Relaxed);
         if depth <= previous_max {
@@ -1958,6 +2171,8 @@ fn handle_direct_group_pair(
     next_batch_id: &mut u64,
     input_flow_control_wait_seconds: &mut f64,
     output_flow_controller: &Arc<OutputFlowController>,
+    pipeline_start: Instant,
+    lifecycle: &Arc<PipelineLifecycleMarkers>,
 ) -> Result<bool> {
     let match_start = Instant::now();
     match (next_forward, next_reverse) {
@@ -1985,6 +2200,8 @@ fn handle_direct_group_pair(
                     next_batch_id,
                     input_flow_control_wait_seconds,
                     output_flow_controller,
+                    pipeline_start,
+                    lifecycle,
                 )?;
             }
         }
@@ -2002,6 +2219,8 @@ fn handle_direct_group_pair(
                     next_batch_id,
                     input_flow_control_wait_seconds,
                     output_flow_controller,
+                    pipeline_start,
+                    lifecycle,
                 )?;
             }
             *pair_match_assembly_seconds += match_start.elapsed().as_secs_f64();
@@ -2148,6 +2367,8 @@ fn sync_parallel_reader_groups(
     next_batch_id: &mut u64,
     input_flow_control_wait_seconds: &mut f64,
     output_flow_controller: &Arc<OutputFlowController>,
+    pipeline_start: Instant,
+    lifecycle: &Arc<PipelineLifecycleMarkers>,
 ) -> Result<()> {
     const SYNC_PREFETCH_TARGET_CHUNKS: usize = 2;
     let mut forward_queue: VecDeque<DirectRecordGroup> = VecDeque::new();
@@ -2291,6 +2512,8 @@ fn sync_parallel_reader_groups(
                             next_batch_id,
                             input_flow_control_wait_seconds,
                             output_flow_controller,
+                            pipeline_start,
+                            lifecycle,
                         )?;
                         sync_diagnostics.output_enqueue_seconds +=
                             enqueue_start.elapsed().as_secs_f64();
@@ -2316,6 +2539,8 @@ fn sync_parallel_reader_groups(
                                 next_batch_id,
                                 input_flow_control_wait_seconds,
                                 output_flow_controller,
+                                pipeline_start,
+                                lifecycle,
                             )?;
                             sync_diagnostics.output_enqueue_seconds +=
                                 enqueue_start.elapsed().as_secs_f64();
@@ -2349,6 +2574,8 @@ fn sync_parallel_reader_groups(
                                 next_batch_id,
                                 input_flow_control_wait_seconds,
                                 output_flow_controller,
+                                pipeline_start,
+                                lifecycle,
                             )?;
                             sync_diagnostics.output_enqueue_seconds +=
                                 enqueue_start.elapsed().as_secs_f64();
@@ -2399,6 +2626,8 @@ fn sync_parallel_reader_groups(
             next_batch_id,
             input_flow_control_wait_seconds,
             output_flow_controller,
+            pipeline_start,
+            lifecycle,
         )?;
         sync_diagnostics.output_enqueue_seconds += enqueue_start.elapsed().as_secs_f64();
     }
@@ -2423,6 +2652,7 @@ fn direct_compute_thread(
     output_queue_capacity: usize,
     runtime_config: DirectWriterRuntimeConfig,
     pipeline_start: Instant,
+    lifecycle: Arc<PipelineLifecycleMarkers>,
 ) -> Result<DirectComputeWorkerStats> {
     const COMPUTE_AHEAD_WINDOW_BATCHES_PER_WORKER: u64 = 2;
     let worker_start = Instant::now();
@@ -2493,6 +2723,12 @@ fn direct_compute_thread(
                 compute_output_send_wait_wall_seconds += output_wait_seconds;
                 output_bytes_submitted.fetch_add(output_batch_bytes, Ordering::Relaxed);
                 let submitted = output_queue_submitted.fetch_add(1, Ordering::Relaxed) + 1;
+                if submitted == 1 {
+                    mark_elapsed_once(
+                        &lifecycle.first_output_batch_submitted_micros,
+                        pipeline_start,
+                    );
+                }
                 flow_controller.on_output_submitted(output_batch_id, output_batch_bytes);
                 let received = output_queue_received.load(Ordering::Relaxed);
                 let depth = submitted.saturating_sub(received) as usize;
@@ -3000,7 +3236,9 @@ fn direct_writer_thread(
     flow_controller: Arc<OutputFlowController>,
     runtime_config: DirectWriterRuntimeConfig,
     pipeline_start: Instant,
+    lifecycle: Arc<PipelineLifecycleMarkers>,
 ) -> Result<DirectWorkerStats> {
+    mark_elapsed_once(&lifecycle.writer_thread_started_micros, pipeline_start);
     let writer_loop_start = Instant::now();
     writer_last_progress_micros.store(0, Ordering::Relaxed);
     let mut worker_stats = DirectWorkerStats::default();
@@ -3014,6 +3252,17 @@ fn direct_writer_thread(
             Ok(batch) => batch,
             Err(_) => break,
         };
+        mark_elapsed_once(
+            &lifecycle.first_writer_batch_received_micros,
+            pipeline_start,
+        );
+        lifecycle.writer_last_batch_received_micros.store(
+            pipeline_start
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
         let output_batch_bytes_estimate = estimate_output_batch_bytes(&output_batch);
         flow_controller.on_writer_received(output_batch.batch_id);
         output_queue_received.fetch_add(1, Ordering::Relaxed);
@@ -3075,6 +3324,14 @@ fn direct_writer_thread(
                 batch.batch_id,
                 batch_bytes_written,
                 batch_write_seconds,
+            );
+            mark_elapsed_once(&lifecycle.first_writer_batch_written_micros, pipeline_start);
+            lifecycle.writer_last_batch_written_micros.store(
+                pipeline_start
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
             );
             writer_last_progress_micros.store(
                 pipeline_start.elapsed().as_micros() as u64,
@@ -3146,6 +3403,7 @@ fn direct_writer_thread(
         .unwrap_or(worker_stats.output_bytes_before_close);
     worker_stats.writer_pre_close_flush_seconds =
         pre_close_checkpoint_start.elapsed().as_secs_f64();
+    mark_elapsed_once(&lifecycle.writer_finalize_start_micros, pipeline_start);
     let output_drop_start = Instant::now();
     drop(output);
     worker_stats.output_drop_close_seconds = output_drop_start.elapsed().as_secs_f64();
@@ -3155,10 +3413,12 @@ fn direct_writer_thread(
         .unwrap_or(worker_stats.output_bytes_before_close);
     let sync_start = Instant::now();
     worker_stats.file_sync_or_drop_seconds = sync_start.elapsed().as_secs_f64();
+    mark_elapsed_once(&lifecycle.writer_finalize_done_micros, pipeline_start);
     worker_stats.bgzf_flush_seconds = 0.0;
     worker_stats.total_output_drain_seconds = worker_stats.writer_periodic_flush_seconds
         + worker_stats.writer_pre_close_flush_seconds
         + worker_stats.hts_close_seconds;
+    mark_elapsed_once(&lifecycle.writer_thread_exit_micros, pipeline_start);
     Ok(worker_stats)
 }
 
