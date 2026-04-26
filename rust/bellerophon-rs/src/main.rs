@@ -1067,6 +1067,14 @@ fn process_direct_batch(batch: DirectInputBatch, quality: u8) -> DirectOutputBat
     }
 }
 
+fn approx_record_payload_bytes(record: &Record) -> u64 {
+    let seq_len = record.seq_len() as u64;
+    let qual_len = record.qual().len() as u64;
+    let qname_len = record.qname().len() as u64;
+    let cigar_ops = record.cigar().len() as u64;
+    qname_len + seq_len + qual_len + (cigar_ops * 4)
+}
+
 fn process_group_pair(
     f_group: DirectRecordGroup,
     r_group: DirectRecordGroup,
