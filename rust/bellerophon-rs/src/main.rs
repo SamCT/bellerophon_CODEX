@@ -1020,11 +1020,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} input_to_compute_queue_max_depth={} input_to_compute_queue_capacity={} compute_to_writer_queue_max_depth={} compute_to_writer_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} input_to_compute_queue_full_events={} compute_to_writer_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} compute_to_writer_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
+            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} input_to_compute_queue_max_depth={} input_to_compute_queue_capacity={} compute_to_writer_queue_max_depth={} compute_to_writer_queue_capacity={} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} input_to_compute_queue_full_events={} compute_to_writer_queue_full_events={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} compute_to_writer_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
             writer_recv_wait_seconds,
             max_queue_depth,
             queue_policy.output_queue_capacity,
             max_compute_output_queue_depth,
+            queue_policy.output_queue_capacity,
+            max_queue_depth,
             queue_policy.output_queue_capacity,
             reader_chunk_queue_stats.max_depth,
             queue_policy.reader_queue_capacity,
@@ -1054,6 +1056,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_stats.estimated_uncompressed_bytes_written,
             output_queue_full_events,
             compute_stats.compute_output_queue_full_events,
+            output_queue_full_events,
             reader_chunk_queue_stats.full_events,
             output_queue_full_events
                 + compute_stats.compute_output_queue_full_events
@@ -2739,16 +2742,39 @@ mod tests {
 
     #[test]
     fn direct_thread_roles_use_conservative_compute_tiers() {
-        let resolution = resolve_direct_thread_roles(16);
-        assert_eq!(resolve_direct_thread_roles(8).compute_workers, 1);
-        assert_eq!(resolve_direct_thread_roles(32).compute_workers, 2);
+        let tier_8 = resolve_direct_thread_roles(8);
+        assert_eq!(tier_8.compute_workers, 1);
+
+        let tier_32 = resolve_direct_thread_roles(32);
+        assert_eq!(
+            tier_32.compute_workers,
+            if tier_32.resolved_total_threads > 2 {
+                2
+            } else {
+                1
+            }
+        );
+
         let tier_96 = resolve_direct_thread_roles(96);
-        if tier_96.resolved_total_threads >= 5 {
-            assert_eq!(tier_96.compute_workers, 4);
-        }
+        assert_eq!(
+            tier_96.compute_workers,
+            if tier_96.resolved_total_threads > 4 {
+                4
+            } else {
+                tier_96.resolved_total_threads.saturating_sub(1).max(1)
+            }
+        );
+
         let tier_128 = resolve_direct_thread_roles(128);
-        assert!(tier_128.compute_workers >= 1);
-        assert_eq!(resolution.htslib_pool_enabled, true);
+        assert_eq!(
+            tier_128.compute_workers,
+            if tier_128.resolved_total_threads > 8 {
+                8
+            } else {
+                tier_128.resolved_total_threads.saturating_sub(1).max(1)
+            }
+        );
+        assert!(tier_128.htslib_pool_enabled);
     }
 
     #[test]
