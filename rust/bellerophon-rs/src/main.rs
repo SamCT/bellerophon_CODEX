@@ -1309,37 +1309,21 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
     let detected_available_parallelism = thread::available_parallelism()
         .map(|threads| threads.get())
         .unwrap_or(1);
-    let explicit_user_cap = parse_env_usize("BELLEROPHON_THREADS_CAP");
-    let resolved_total_threads = explicit_user_cap
-        .map(|cap| requested.min(cap))
-        .unwrap_or(requested)
-        .min(detected_available_parallelism)
-        .max(1);
+    let explicit_user_cap = None;
+    let resolved_total_threads = requested.min(detected_available_parallelism).max(1);
 
-    let htslib_pool_enabled = !parse_env_bool("BELLEROPHON_DIRECT_DISABLE_HTSLIB_TPOOL");
-    let bgzf_cap = parse_env_usize("BELLEROPHON_DIRECT_BGZF_THREADS_CAP").unwrap_or(8);
-    let total_bgzf_workers = if htslib_pool_enabled {
-        let default_bgzf = (resolved_total_threads / 4).max(1);
-        default_bgzf
-            .min(bgzf_cap)
-            .min(resolved_total_threads.saturating_sub(1).max(1))
-    } else {
-        0
-    };
-    let compute_workers = resolved_total_threads
-        .saturating_sub(total_bgzf_workers)
+    // Keep direct mode simple and compression-first:
+    // - reserve a minimal compute budget for pair assembly/filtering
+    // - reserve 1 BGZF worker target for each reader when possible
+    // - allocate the rest of BGZF workers to the output writer target
+    let htslib_pool_enabled = true;
+    let compute_workers = if resolved_total_threads > 1 { 1 } else { 0 };
+    let total_bgzf_workers = resolved_total_threads
+        .saturating_sub(compute_workers)
         .max(1);
-    let writer_bgzf_workers = if total_bgzf_workers > 0 {
-        (total_bgzf_workers / 3).max(1)
-    } else {
-        0
-    };
-    let remaining_reader_workers = total_bgzf_workers.saturating_sub(writer_bgzf_workers);
-    let per_reader_bgzf_workers = if total_bgzf_workers > 0 {
-        (remaining_reader_workers / 2).max(1)
-    } else {
-        0
-    };
+    let reader_total_bgzf_workers = total_bgzf_workers.saturating_sub(1).min(2);
+    let per_reader_bgzf_workers = if reader_total_bgzf_workers >= 2 { 1 } else { 0 };
+    let writer_bgzf_workers = total_bgzf_workers.saturating_sub(reader_total_bgzf_workers);
     let assigned_threads = total_bgzf_workers + compute_workers;
     let unused_threads = resolved_total_threads.saturating_sub(assigned_threads);
 
@@ -1356,25 +1340,6 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
         unused_threads,
         htslib_pool_enabled,
     }
-}
-
-fn parse_env_bool(key: &str) -> bool {
-    env::var(key)
-        .ok()
-        .map(|raw| {
-            matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn parse_env_usize(key: &str) -> Option<usize> {
-    env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
 }
 
 fn compression_level_from_u8(level: u8) -> CompressionLevel {
@@ -1436,15 +1401,6 @@ fn stage_log(cli: &Cli, message: String) {
 mod tests {
     use super::*;
     use rust_htslib::bam::record::CigarString;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     fn make_record(name: &[u8], reverse: bool, mapq: u8, cigar: CigarString) -> Record {
         let mut record = Record::new();
@@ -1667,15 +1623,13 @@ mod tests {
 
     #[test]
     fn direct_thread_roles_use_requested_threads_without_hidden_32_cap() {
-        let _guard = env_guard();
-        std::env::remove_var("BELLEROPHON_THREADS_CAP");
         let resolution = resolve_direct_thread_roles(128);
         assert_eq!(
             resolution.resolved_total_threads,
             resolution.detected_available_parallelism
         );
         assert!(resolution.total_bgzf_workers >= 1);
-        assert!(resolution.compute_workers >= 1);
+        assert!(resolution.compute_workers <= 1);
         assert_eq!(resolution.unused_threads, 0);
         assert_eq!(
             resolution.assigned_threads,
@@ -1685,8 +1639,6 @@ mod tests {
 
     #[test]
     fn direct_thread_roles_only_back_off_for_available_parallelism() {
-        let _guard = env_guard();
-        std::env::remove_var("BELLEROPHON_THREADS_CAP");
         let requested = 64usize;
         let resolution = resolve_direct_thread_roles(requested);
         assert_eq!(
@@ -1701,47 +1653,32 @@ mod tests {
     }
 
     #[test]
-    fn direct_thread_roles_respect_explicit_user_cap() {
-        let _guard = env_guard();
-        std::env::set_var("BELLEROPHON_THREADS_CAP", "12");
+    fn direct_thread_roles_writer_gets_majority_of_bgzf_budget() {
         let resolution = resolve_direct_thread_roles(64);
-        assert_eq!(resolution.explicit_user_cap, Some(12));
-        assert_eq!(
-            resolution.resolved_total_threads,
-            12usize.min(resolution.detected_available_parallelism)
-        );
-        std::env::remove_var("BELLEROPHON_THREADS_CAP");
+        if resolution.resolved_total_threads >= 6 {
+            assert!(resolution.writer_bgzf_workers > resolution.per_reader_bgzf_workers * 2);
+            assert!(resolution.writer_bgzf_workers > resolution.compute_workers);
+        }
     }
 
     #[test]
-    fn direct_thread_roles_can_disable_htslib_pool() {
-        let _guard = env_guard();
-        std::env::set_var("BELLEROPHON_DIRECT_DISABLE_HTSLIB_TPOOL", "1");
-        std::env::remove_var("BELLEROPHON_THREADS_CAP");
+    fn direct_thread_roles_keep_small_fixed_compute_budget() {
         let resolution = resolve_direct_thread_roles(16);
-        assert!(!resolution.htslib_pool_enabled);
-        assert_eq!(resolution.total_bgzf_workers, 0);
-        assert_eq!(
-            resolution.compute_workers,
-            resolution.resolved_total_threads
-        );
-        std::env::remove_var("BELLEROPHON_DIRECT_DISABLE_HTSLIB_TPOOL");
+        assert_eq!(resolution.compute_workers, 1);
+        assert_eq!(resolution.htslib_pool_enabled, true);
     }
 
     #[test]
-    fn direct_thread_roles_limit_bgzf_workers_by_cap() {
-        let _guard = env_guard();
-        std::env::set_var("BELLEROPHON_DIRECT_BGZF_THREADS_CAP", "2");
-        std::env::remove_var("BELLEROPHON_THREADS_CAP");
+    fn direct_thread_roles_allocate_reader_targets_before_writer_remainder() {
         let resolution = resolve_direct_thread_roles(32);
-        assert!(resolution.htslib_pool_enabled);
-        assert!(resolution.total_bgzf_workers <= 2);
-        assert!(resolution.total_bgzf_workers >= 1);
+        if resolution.total_bgzf_workers >= 3 {
+            assert_eq!(resolution.per_reader_bgzf_workers, 1);
+        }
+        assert!(resolution.writer_bgzf_workers >= 1);
         assert_eq!(
             resolution.compute_workers + resolution.total_bgzf_workers,
             resolution.resolved_total_threads
         );
-        std::env::remove_var("BELLEROPHON_DIRECT_BGZF_THREADS_CAP");
     }
 
     #[test]
