@@ -110,6 +110,28 @@ def parse_stage_metrics(path):
         row['direct_s'] = direct.group(2)
         row['output_mb'] = direct.group(4)
 
+    def parse_stage_kv(stage_name):
+        match = re.search(rf'^STAGE {stage_name} (.+)$', text, flags=re.MULTILINE)
+        if not match:
+            return {}
+        values = {}
+        for part in match.group(1).split():
+            if '=' not in part:
+                continue
+            key, value = part.split('=', 1)
+            values[key] = value
+        return values
+
+    row.update(parse_stage_kv('direct_output_flow_summary'))
+    row.update(parse_stage_kv('writer_tail_breakdown'))
+    row.update(parse_stage_kv('output_flow_controller_summary'))
+    row.update(parse_stage_kv('direct_total_summary'))
+
+    legacy_total = parse_stage_kv('direct_summary').get('total_output_drain_seconds')
+    if legacy_total and 'writer_tail_seconds' in row:
+        row['legacy_total_output_drain_seconds'] = legacy_total
+        row['total_output_drain_seconds_rejected'] = 'true'
+
     return row
 
 
