@@ -74,11 +74,11 @@ def run_one(args, runner, strategy, quality, threads, base_dir):
             str(threads),
             '--log-level',
             'info',
-            '--pipeline',
-            RUNNER_PIPELINE[runner],
             '--tmp-dir',
             run_dir,
         ]
+        if runner != 'rust_direct':
+            cmd.extend(['--pipeline', RUNNER_PIPELINE[runner]])
 
     with open(log_txt, 'w', encoding='utf-8') as log_fh:
         subprocess.run(cmd, check=True, env=env, stdout=log_fh, stderr=subprocess.STDOUT)

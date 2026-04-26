@@ -19,25 +19,19 @@ cargo fmt --manifest-path rust/bellerophon-rs/Cargo.toml
 cargo test --manifest-path rust/bellerophon-rs/Cargo.toml
 ```
 
-## Pipeline support
+## Thread model
 
-- `--pipeline legacy-temp`: mirrors Python temp-BAM flow.
-- `--pipeline pair-temp`: pair-aware filter, temp BAM only for surviving pairs.
-- `--pipeline direct`: pair-aware filter, writes final BAM directly.
-
-## Direct mode thread model
-
-- `--threads` is the total thread budget for direct mode.
+- `--threads` is the total thread budget.
 - Resolved total threads are `min(--threads, available_parallelism())`.
 - There is no hidden default cap (for example no implicit 32-thread ceiling).
-- Direct mode uses a single shared HTSlib BGZF thread pool (`set_thread_pool`) attached to both readers and the writer.
+- Uses a single shared HTSlib BGZF thread pool (`set_thread_pool`) attached to both readers and the writer.
 - The resolved total is split adaptively into:
   - total BGZF workers
   - per-reader BGZF workers (target share)
   - writer BGZF workers (target share)
   - compute workers for batch processing
 
-## Direct-mode benchmarking matrix
+## Benchmarking matrix
 
 Use even thread counts and focus on thread-scaling effects:
 
@@ -45,7 +39,6 @@ Use even thread counts and focus on thread-scaling effects:
 for t in 16 32 64 128; do
   /usr/bin/time -f "threads=${t} elapsed=%e" \
     target/release/bellerophon-rs \
-    --pipeline direct \
     --forward /scratch/forward.bam \
     --reverse /scratch/reverse.bam \
     --output /scratch/out.t${t}.bam \

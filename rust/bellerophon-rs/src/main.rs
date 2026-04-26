@@ -38,17 +38,17 @@ struct Cli {
     output: PathBuf,
     #[arg(short = 'q', long = "quality", default_value_t = 20)]
     quality: u8,
-    /// Total thread budget for the selected pipeline.
-    /// Direct mode resolves this to min(--threads, available_parallelism()).
+    /// Total thread budget.
+    /// Resolved to min(--threads, available_parallelism()).
     #[arg(short = 't', long = "threads", default_value_t = 1)]
     threads: usize,
-    /// BAM compression level for output in direct mode (0-9).
+    /// BAM compression level for output (0-9).
     /// If omitted, HTSlib default is used.
     #[arg(long = "compression-level", value_parser = clap::value_parser!(u8).range(0..=9))]
     compression_level: Option<u8>,
     #[arg(short = 'l', long = "log-level", default_value = "error")]
     log_level: LogLevel,
-    #[arg(long = "pipeline", value_enum)]
+    #[arg(long = "pipeline", value_enum, hide = true, default_value = "direct")]
     pipeline: Pipeline,
     #[arg(long = "tmp-dir", default_value = ".")]
     tmp_dir: PathBuf,

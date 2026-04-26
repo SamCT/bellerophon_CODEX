@@ -106,15 +106,21 @@ for quality in "${QUALITY_ARRAY[@]}"; do
     rust_log="$WORK_DIR/rust_${pipeline_trimmed}_q${quality_trimmed}.log"
     tmp_dir="$WORK_DIR/tmp_${pipeline_trimmed}_q${quality_trimmed}"
 
-    "$RUST_BIN" \
-      --forward "$FORWARD" \
-      --reverse "$REVERSE" \
-      --output "$rust_bam" \
-      --quality "$quality_trimmed" \
-      --threads "$THREADS" \
-      --log-level info \
-      --pipeline "$pipeline_trimmed" \
-      --tmp-dir "$tmp_dir" >"$rust_log" 2>&1
+    rust_cmd=(
+      "$RUST_BIN"
+      --forward "$FORWARD"
+      --reverse "$REVERSE"
+      --output "$rust_bam"
+      --quality "$quality_trimmed"
+      --threads "$THREADS"
+      --log-level info
+      --tmp-dir "$tmp_dir"
+    )
+    if [ "$pipeline_trimmed" != "direct" ]; then
+      rust_cmd+=(--pipeline "$pipeline_trimmed")
+    fi
+
+    "${rust_cmd[@]}" >"$rust_log" 2>&1
 
     python_records="$WORK_DIR/python_q${quality_trimmed}.records.sam"
     rust_records="$WORK_DIR/rust_${pipeline_trimmed}_q${quality_trimmed}.records.sam"
