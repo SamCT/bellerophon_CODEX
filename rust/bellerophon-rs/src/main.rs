@@ -201,9 +201,9 @@ struct DirectWorkerStats {
     ordered_writer_largest_received_batch_id: u64,
     max_completed_batch_gap_at_writer: u64,
     ordered_writer_waiting_for_batch_topn: String,
-    writer_periodic_visibility_check_count: u64,
-    writer_periodic_visibility_check_seconds: f64,
-    writer_periodic_visible_bytes_max: u64,
+    writer_periodic_flush_count: u64,
+    writer_periodic_flush_seconds: f64,
+    writer_pre_close_flush_seconds: f64,
     output_bytes_before_close: u64,
     output_bytes_after_close: u64,
     records_written_before_close: u64,
@@ -212,7 +212,7 @@ struct DirectWorkerStats {
 
 #[derive(Clone, Copy, Debug)]
 struct DirectWriterRuntimeConfig {
-    periodic_visibility_check_batch_interval: u64,
+    periodic_flush_batch_interval: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -752,7 +752,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} writer_periodic_visibility_check_batch_interval={} reader_mode={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_queue_policy=auto_bounded",
+            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} writer_periodic_flush_batch_interval={} reader_mode={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_queue_policy=auto_bounded",
             setup_start.elapsed().as_secs_f64(),
             thread_resolution.total_bgzf_workers,
             thread_resolution.compute_workers,
@@ -765,7 +765,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             split_workers.forward,
             split_workers.reverse,
             split_workers.output,
-            writer_runtime_config.periodic_visibility_check_batch_interval,
+            writer_runtime_config.periodic_flush_batch_interval,
             direct_reader_mode_name(&cli.direct_reader_mode),
             queue_policy.output_queue_capacity,
             queue_policy.reader_queue_capacity,
@@ -1273,14 +1273,14 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} writer_periodic_visibility_check_count={} writer_periodic_visibility_check_seconds={:.6} writer_periodic_visible_bytes_max={} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
+            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
             write_call_seconds,
             writer_stats.hts_close_seconds,
             close_to_write_ratio,
             close_note,
-            writer_stats.writer_periodic_visibility_check_count,
-            writer_stats.writer_periodic_visibility_check_seconds,
-            writer_stats.writer_periodic_visible_bytes_max,
+            writer_stats.writer_periodic_flush_count,
+            writer_stats.writer_periodic_flush_seconds,
+            writer_stats.writer_pre_close_flush_seconds,
             writer_stats.pending_batches_before_close,
             writer_stats.records_written_before_close,
             writer_stats.output_bytes_before_close,
@@ -1935,7 +1935,7 @@ fn direct_writer_thread(
     let mut next_batch_id = 0u64;
     let mut pending: BTreeMap<u64, DirectOutputBatch> = BTreeMap::new();
     let mut waiting_for_batch_counts: HashMap<u64, u64> = HashMap::new();
-    let mut batches_since_visibility_check = 0u64;
+    let mut batches_since_flush = 0u64;
     loop {
         let recv_wait_start = Instant::now();
         let output_batch = match batch_receiver.recv() {
@@ -1992,20 +1992,15 @@ fn direct_writer_thread(
                     (f_record.inner().l_data + r_record.inner().l_data) as u64;
             }
             worker_stats.write_call_seconds += write_start.elapsed().as_secs_f64();
-            batches_since_visibility_check += 1;
-            if batches_since_visibility_check
-                >= runtime_config.periodic_visibility_check_batch_interval
-            {
-                let visibility_check_start = Instant::now();
-                if let Ok(meta) = fs::metadata(&output_path) {
-                    worker_stats.writer_periodic_visible_bytes_max = worker_stats
-                        .writer_periodic_visible_bytes_max
-                        .max(meta.len());
-                }
-                worker_stats.writer_periodic_visibility_check_seconds +=
-                    visibility_check_start.elapsed().as_secs_f64();
-                worker_stats.writer_periodic_visibility_check_count += 1;
-                batches_since_visibility_check = 0;
+            batches_since_flush += 1;
+            if batches_since_flush >= runtime_config.periodic_flush_batch_interval {
+                let flush_start = Instant::now();
+                output
+                    .flush()
+                    .context("failed to flush direct output writer during periodic drain")?;
+                worker_stats.writer_periodic_flush_seconds += flush_start.elapsed().as_secs_f64();
+                worker_stats.writer_periodic_flush_count += 1;
+                batches_since_flush = 0;
             }
             next_batch_id += 1;
             ordered_writer_next_expected_batch_id.store(next_batch_id, Ordering::Relaxed);
@@ -2030,6 +2025,11 @@ fn direct_writer_thread(
     worker_stats.output_bytes_before_close = fs::metadata(&output_path)
         .map(|meta| meta.len())
         .unwrap_or(0);
+    let pre_close_flush_start = Instant::now();
+    output
+        .flush()
+        .context("failed to flush direct output writer before close")?;
+    worker_stats.writer_pre_close_flush_seconds = pre_close_flush_start.elapsed().as_secs_f64();
     let output_drop_start = Instant::now();
     drop(output);
     worker_stats.output_drop_close_seconds = output_drop_start.elapsed().as_secs_f64();
@@ -2791,9 +2791,9 @@ fn resolve_direct_writer_runtime_config(
     let writer_workers = intended_writer_bgzf_workers.max(1) as u64;
     let base_interval = (2048u64 / writer_workers).max(8);
     let thread_bias = (bounded_threads / 16).max(1);
-    let periodic_visibility_check_batch_interval = (base_interval / thread_bias).clamp(4, 256);
+    let periodic_flush_batch_interval = (base_interval / thread_bias).clamp(4, 256);
     DirectWriterRuntimeConfig {
-        periodic_visibility_check_batch_interval,
+        periodic_flush_batch_interval,
     }
 }
 
