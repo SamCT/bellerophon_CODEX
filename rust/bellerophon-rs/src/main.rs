@@ -1024,7 +1024,7 @@ fn direct_writer_thread(
                 .context("failed to write direct output reverse record")?;
             worker_stats.records_written += 2;
             worker_stats.estimated_uncompressed_bytes_written +=
-                approx_record_payload_bytes(f_record) + approx_record_payload_bytes(r_record);
+                (f_record.data().len() + r_record.data().len()) as u64;
         }
         worker_stats.write_call_seconds += write_start.elapsed().as_secs_f64();
     }
