@@ -2889,28 +2889,20 @@ impl OutputFlowController {
         } else {
             1.0 * 1024.0 * 1024.0
         };
-        let baseline_target_lag_seconds = if density > 4.0 * 1024.0 * 1024.0 {
-            0.32
+        let target_lag_seconds = if density > 4.0 * 1024.0 * 1024.0 {
+            0.35
         } else {
-            0.72
+            0.9
         };
-        let current_lag_seconds = Self::debt_bytes(inner) as f64 / bps.max(1.0);
-        let lag_tightening = if current_lag_seconds > baseline_target_lag_seconds * 2.4 {
-            0.45
-        } else if current_lag_seconds > baseline_target_lag_seconds * 1.5 {
-            0.65
-        } else {
-            1.0
-        };
-        let target_lag_seconds = (baseline_target_lag_seconds * lag_tightening).max(0.12);
         let debt_byte_limit = (bps * target_lag_seconds).max(8.0 * 1024.0 * 1024.0) as u64;
         let debt_batch_limit =
-            ((debt_byte_limit as f64 / density.max(256.0)).ceil() as u64).clamp(4, 96);
+            ((debt_byte_limit as f64 / density.max(256.0)).ceil() as u64).clamp(4, 128);
         let ordered_batch_limit = (debt_batch_limit / 2).max(2);
         let ordered_byte_limit = debt_byte_limit / 2;
-        let adaptive_compute = if current_lag_seconds > target_lag_seconds * 2.5 {
+        let lag_seconds = Self::debt_bytes(inner) as f64 / bps.max(1.0);
+        let adaptive_compute = if lag_seconds > target_lag_seconds * 3.0 {
             1
-        } else if current_lag_seconds > target_lag_seconds * 1.5 {
+        } else if lag_seconds > target_lag_seconds * 2.0 {
             (max_compute_workers / 2).max(1)
         } else {
             max_compute_workers.max(1)
@@ -2945,7 +2937,11 @@ impl OutputFlowController {
         {
             return true;
         }
-        inner.compute_active >= adaptive_compute
+        let moderate_pressure = debt_bytes > debt_byte_limit / 2
+            || debt_batches > debt_batch_limit / 2
+            || inner.ordered_pending_bytes_estimate > debt_byte_limit / 2
+            || completed_gap > ordered_limit;
+        moderate_pressure && inner.compute_active >= adaptive_compute
     }
     fn should_wait_output_submit(inner: &OutputFlowInner, max_compute_workers: usize) -> bool {
         let debt_bytes = Self::debt_bytes(inner);
