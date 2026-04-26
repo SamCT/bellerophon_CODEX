@@ -212,13 +212,17 @@ struct DirectWorkerStats {
 
 #[derive(Clone, Copy, Debug)]
 struct DirectWriterRuntimeConfig {
-    periodic_flush_batch_interval: u64,
     flow_target_backlog_seconds: f64,
     flow_min_inflight_bytes: u64,
     flow_max_inflight_bytes: u64,
     flow_max_queue_backlog_batches: u64,
     flow_stale_progress_micros: u64,
     flow_wait_poll_micros: u64,
+    drain_min_interval_micros: u64,
+    drain_base_bytes: u64,
+    drain_backlog_trigger_batches: u64,
+    drain_expensive_threshold_micros: u64,
+    drain_backoff_shift_max: u8,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -788,7 +792,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} writer_periodic_flush_batch_interval={} flow_target_backlog_seconds={:.3} flow_min_inflight_bytes={} flow_max_inflight_bytes={} flow_max_queue_backlog_batches={} reader_mode={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_queue_policy=auto_bounded",
+            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} writer_drain_min_interval_micros={} writer_drain_base_bytes={} writer_drain_backlog_trigger_batches={} flow_target_backlog_seconds={:.3} flow_min_inflight_bytes={} flow_max_inflight_bytes={} flow_max_queue_backlog_batches={} reader_mode={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_queue_policy=auto_bounded",
             setup_start.elapsed().as_secs_f64(),
             thread_resolution.total_bgzf_workers,
             thread_resolution.compute_workers,
@@ -801,7 +805,9 @@ fn run_direct(cli: &Cli) -> Result<()> {
             split_workers.forward,
             split_workers.reverse,
             split_workers.output,
-            writer_runtime_config.periodic_flush_batch_interval,
+            writer_runtime_config.drain_min_interval_micros,
+            writer_runtime_config.drain_base_bytes,
+            writer_runtime_config.drain_backlog_trigger_batches,
             writer_runtime_config.flow_target_backlog_seconds,
             writer_runtime_config.flow_min_inflight_bytes,
             writer_runtime_config.flow_max_inflight_bytes,
@@ -2059,6 +2065,7 @@ fn direct_writer_thread(
     let mut waiting_for_batch_counts: HashMap<u64, u64> = HashMap::new();
     let mut bytes_since_checkpoint = 0u64;
     let mut last_checkpoint = Instant::now();
+    let mut drain_backoff_shift = 0u8;
     loop {
         let recv_wait_start = Instant::now();
         let output_batch = match batch_receiver.recv() {
@@ -2134,11 +2141,29 @@ fn direct_writer_thread(
                 writer_bytes_per_second_estimate.store(next_bps, Ordering::Relaxed);
             }
             bytes_since_checkpoint = bytes_since_checkpoint.saturating_add(batch_bytes_written);
-            let should_checkpoint = bytes_since_checkpoint
-                >= (runtime_config.flow_min_inflight_bytes / 2).max(1)
-                || last_checkpoint.elapsed().as_secs_f64()
-                    >= runtime_config.flow_target_backlog_seconds
-                || pending.len() as u64 >= runtime_config.flow_max_queue_backlog_batches;
+            let writer_bps = writer_bytes_per_second_estimate.load(Ordering::Relaxed);
+            let dynamic_target_bytes = if writer_bps == 0 {
+                runtime_config.drain_base_bytes
+            } else {
+                ((writer_bps as f64) * runtime_config.flow_target_backlog_seconds) as u64
+            }
+            .clamp(
+                runtime_config.drain_base_bytes,
+                runtime_config.flow_max_inflight_bytes,
+            );
+            let drain_target_bytes = dynamic_target_bytes
+                .checked_shl(drain_backoff_shift as u32)
+                .unwrap_or(u64::MAX)
+                .min(runtime_config.flow_max_inflight_bytes);
+            let elapsed_since_checkpoint_micros = last_checkpoint
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            let should_checkpoint = bytes_since_checkpoint >= drain_target_bytes
+                && elapsed_since_checkpoint_micros >= runtime_config.drain_min_interval_micros
+                || pending.len() as u64 >= runtime_config.drain_backlog_trigger_batches
+                    && elapsed_since_checkpoint_micros
+                        >= runtime_config.drain_min_interval_micros / 2;
             if should_checkpoint {
                 let checkpoint_start = Instant::now();
                 // rust-htslib::bam::Writer does not expose a flush API in rust-htslib 0.51.0.
@@ -2146,9 +2171,19 @@ fn direct_writer_thread(
                 let _periodic_output_bytes = fs::metadata(&output_path)
                     .map(|meta| meta.len())
                     .unwrap_or(0);
-                worker_stats.writer_periodic_flush_seconds +=
-                    checkpoint_start.elapsed().as_secs_f64();
+                let checkpoint_micros = checkpoint_start
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+                worker_stats.writer_periodic_flush_seconds += checkpoint_micros as f64 / 1e6f64;
                 worker_stats.writer_periodic_flush_count += 1;
+                if checkpoint_micros >= runtime_config.drain_expensive_threshold_micros {
+                    drain_backoff_shift = drain_backoff_shift
+                        .saturating_add(1)
+                        .min(runtime_config.drain_backoff_shift_max);
+                } else if drain_backoff_shift > 0 {
+                    drain_backoff_shift -= 1;
+                }
                 bytes_since_checkpoint = 0;
                 last_checkpoint = Instant::now();
             }
@@ -2941,9 +2976,6 @@ fn resolve_direct_writer_runtime_config(
 ) -> DirectWriterRuntimeConfig {
     let bounded_threads = requested_threads.max(1) as u64;
     let writer_workers = intended_writer_bgzf_workers.max(1) as u64;
-    let base_interval = (2048u64 / writer_workers).max(8);
-    let thread_bias = (bounded_threads / 16).max(1);
-    let periodic_flush_batch_interval = (base_interval / thread_bias).clamp(4, 256);
     let flow_target_backlog_seconds = if bounded_threads >= 64 { 0.18 } else { 0.24 };
     let flow_min_inflight_bytes = (8 * 1024 * 1024u64).saturating_mul(writer_workers.min(8));
     let flow_max_inflight_bytes = (64 * 1024 * 1024u64)
@@ -2952,14 +2984,29 @@ fn resolve_direct_writer_runtime_config(
     let flow_max_queue_backlog_batches = (writer_workers * 2).clamp(4, 32);
     let flow_stale_progress_micros = 100_000;
     let flow_wait_poll_micros = 75;
+    let drain_min_interval_micros = if bounded_threads >= 64 {
+        2_500_000
+    } else {
+        4_000_000
+    };
+    let drain_base_bytes = (64 * 1024 * 1024u64)
+        .saturating_mul(writer_workers.min(8))
+        .min(flow_max_inflight_bytes);
+    let drain_backlog_trigger_batches = (writer_workers * 4).clamp(6, 48);
+    let drain_expensive_threshold_micros = 250_000;
+    let drain_backoff_shift_max = 4;
     DirectWriterRuntimeConfig {
-        periodic_flush_batch_interval,
         flow_target_backlog_seconds,
         flow_min_inflight_bytes,
         flow_max_inflight_bytes,
         flow_max_queue_backlog_batches,
         flow_stale_progress_micros,
         flow_wait_poll_micros,
+        drain_min_interval_micros,
+        drain_base_bytes,
+        drain_backlog_trigger_batches,
+        drain_expensive_threshold_micros,
+        drain_backoff_shift_max,
     }
 }
 
