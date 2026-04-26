@@ -23,6 +23,18 @@ enum Pipeline {
     Direct,
 }
 
+#[derive(Clone, Debug, ValueEnum, Eq, PartialEq)]
+enum DirectHtslibPoolMode {
+    Shared,
+    SplitPerHandle,
+}
+
+#[derive(Clone, Debug, ValueEnum, Eq, PartialEq)]
+enum DirectReaderMode {
+    Serial,
+    DualThreadDiagnostic,
+}
+
 #[derive(Clone, Debug, ValueEnum, Eq, PartialEq, Ord, PartialOrd)]
 enum LogLevel {
     Critical,
@@ -58,6 +70,12 @@ struct Cli {
     /// Number of query-name groups per direct pipeline batch.
     #[arg(long = "direct-batch-size", default_value_t = 1024)]
     direct_batch_size: usize,
+    /// HTSlib BGZF pool wiring mode for direct pipeline diagnostics.
+    #[arg(long = "direct-htslib-pool-mode", value_enum, default_value = "shared")]
+    direct_htslib_pool_mode: DirectHtslibPoolMode,
+    /// Reader execution mode for direct pipeline diagnostics.
+    #[arg(long = "direct-reader-mode", value_enum, default_value = "serial")]
+    direct_reader_mode: DirectReaderMode,
     #[arg(long = "tmp-dir", default_value = ".")]
     tmp_dir: PathBuf,
 }
@@ -144,9 +162,26 @@ struct DirectWorkerStats {
     process_seconds: f64,
     write_call_seconds: f64,
     output_drop_close_seconds: f64,
+    bgzf_flush_seconds: f64,
+    hts_close_seconds: f64,
+    file_sync_or_drop_seconds: f64,
     batches_processed: u64,
     total_batch_size: u64,
     max_batch_size: usize,
+}
+
+#[derive(Default, Clone, Debug)]
+struct ReaderDecodeStats {
+    wall_seconds: f64,
+    decode_seconds: f64,
+    records_decoded: u64,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+struct SplitBgzfWorkers {
+    forward: usize,
+    reverse: usize,
+    output: usize,
 }
 
 #[derive(Debug)]
@@ -464,28 +499,67 @@ fn run_direct(cli: &Cli) -> Result<()> {
         .with_context(|| format!("failed to open forward input {}", cli.forward.display()))?;
     let mut reverse_reader = bam::Reader::from_path(&cli.reverse)
         .with_context(|| format!("failed to open reverse input {}", cli.reverse.display()))?;
-    let bgzf_pool = if thread_resolution.htslib_pool_enabled {
-        let pool = ThreadPool::new(thread_resolution.total_bgzf_workers as u32)
-            .context("failed to create shared BGZF thread pool")?;
-        forward_reader
-            .set_thread_pool(&pool)
-            .context("failed to attach BGZF pool to forward input")?;
-        reverse_reader
-            .set_thread_pool(&pool)
-            .context("failed to attach BGZF pool to reverse input")?;
-        Some(pool)
-    } else {
-        None
-    };
+    let split_workers = resolve_split_bgzf_workers(thread_resolution.total_bgzf_workers);
+    let mut shared_bgzf_pool: Option<ThreadPool> = None;
+    let mut forward_bgzf_pool: Option<ThreadPool> = None;
+    let mut reverse_bgzf_pool: Option<ThreadPool> = None;
+    let mut output_bgzf_pool: Option<ThreadPool> = None;
+    if thread_resolution.htslib_pool_enabled {
+        match cli.direct_htslib_pool_mode {
+            DirectHtslibPoolMode::Shared => {
+                let pool = ThreadPool::new(thread_resolution.total_bgzf_workers as u32)
+                    .context("failed to create shared BGZF thread pool")?;
+                forward_reader
+                    .set_thread_pool(&pool)
+                    .context("failed to attach shared BGZF pool to forward input")?;
+                reverse_reader
+                    .set_thread_pool(&pool)
+                    .context("failed to attach shared BGZF pool to reverse input")?;
+                shared_bgzf_pool = Some(pool);
+            }
+            DirectHtslibPoolMode::SplitPerHandle => {
+                if split_workers.forward > 0 {
+                    let pool = ThreadPool::new(split_workers.forward as u32)
+                        .context("failed to create forward BGZF thread pool")?;
+                    forward_reader
+                        .set_thread_pool(&pool)
+                        .context("failed to attach forward BGZF pool to forward input")?;
+                    forward_bgzf_pool = Some(pool);
+                }
+                if split_workers.reverse > 0 {
+                    let pool = ThreadPool::new(split_workers.reverse as u32)
+                        .context("failed to create reverse BGZF thread pool")?;
+                    reverse_reader
+                        .set_thread_pool(&pool)
+                        .context("failed to attach reverse BGZF pool to reverse input")?;
+                    reverse_bgzf_pool = Some(pool);
+                }
+            }
+        }
+    }
     verify_matching_references(forward_reader.header(), reverse_reader.header())?;
 
     let header = bam::Header::from_template(forward_reader.header());
     let mut output = Writer::from_path(&cli.output, &header, bam::Format::Bam)
         .with_context(|| format!("failed to create output {}", cli.output.display()))?;
-    if let Some(pool) = bgzf_pool.as_ref() {
-        output
-            .set_thread_pool(pool)
-            .context("failed to attach BGZF pool to output")?;
+    match cli.direct_htslib_pool_mode {
+        DirectHtslibPoolMode::Shared => {
+            if let Some(pool) = shared_bgzf_pool.as_ref() {
+                output
+                    .set_thread_pool(pool)
+                    .context("failed to attach shared BGZF pool to output")?;
+            }
+        }
+        DirectHtslibPoolMode::SplitPerHandle => {
+            if split_workers.output > 0 {
+                let pool = ThreadPool::new(split_workers.output as u32)
+                    .context("failed to create output BGZF thread pool")?;
+                output
+                    .set_thread_pool(&pool)
+                    .context("failed to attach output BGZF pool to output writer")?;
+                output_bgzf_pool = Some(pool);
+            }
+        }
     }
     if let Some(level) = cli.compression_level {
         output
@@ -504,7 +578,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={}",
+            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} reader_mode={}",
             setup_start.elapsed().as_secs_f64(),
             thread_resolution.total_bgzf_workers,
             thread_resolution.compute_workers,
@@ -512,83 +586,118 @@ fn run_direct(cli: &Cli) -> Result<()> {
             cli.compression_level
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "htslib_default".to_string()),
-            thread_resolution.htslib_pool_enabled
+            thread_resolution.htslib_pool_enabled,
+            direct_htslib_pool_mode_name(&cli.direct_htslib_pool_mode),
+            split_workers.forward,
+            split_workers.reverse,
+            split_workers.output,
+            direct_reader_mode_name(&cli.direct_reader_mode)
         ),
     );
 
     let read_match_start = Instant::now();
-    let mut forward_read_decode_seconds = 0.0f64;
-    let mut reverse_read_decode_seconds = 0.0f64;
+    let mut forward_reader_stats = ReaderDecodeStats::default();
+    let mut reverse_reader_stats = ReaderDecodeStats::default();
     let mut pair_match_assembly_seconds = 0.0f64;
     let mut batch_enqueue_wait_seconds = 0.0f64;
     let mut groups_seen: u64 = 0;
-
-    let mut forward_pending = None;
-    let mut reverse_pending = None;
-    let mut forward_record = Record::new();
-    let mut reverse_record = Record::new();
     let mut active_batch: Vec<(DirectRecordGroup, DirectRecordGroup)> =
         Vec::with_capacity(cli.direct_batch_size);
+    let mut reader_threads_spawned = 0usize;
+    let mut reader_threads_active_high_watermark = 1usize;
 
-    loop {
-        let next_forward = next_group_records_read(
-            &mut forward_reader,
-            &mut forward_pending,
-            &mut forward_record,
-            &mut forward_read_decode_seconds,
-        )?;
-        let next_reverse = next_group_records_read(
-            &mut reverse_reader,
-            &mut reverse_pending,
-            &mut reverse_record,
-            &mut reverse_read_decode_seconds,
-        )?;
-        let match_start = Instant::now();
-        match (next_forward, next_reverse) {
-            (Some(f_group), Some(r_group)) => {
-                if f_group.qname() != r_group.qname() {
-                    bail!(
-                        "direct group name mismatch at group {}: forward={} reverse={}",
-                        groups_seen + active_batch.len() as u64 + 1,
-                        String::from_utf8_lossy(f_group.qname()),
-                        String::from_utf8_lossy(r_group.qname())
-                    );
-                }
-                active_batch.push((f_group, r_group));
-                groups_seen += 1;
-                if active_batch.len() >= cli.direct_batch_size {
-                    flush_direct_batch(
-                        &mut active_batch,
-                        &batch_sender,
-                        &queue_depth,
-                        &max_queue_depth,
-                        &mut batch_enqueue_wait_seconds,
-                        cli.direct_batch_size,
-                    )?;
+    match cli.direct_reader_mode {
+        DirectReaderMode::Serial => {
+            let mut forward_pending = None;
+            let mut reverse_pending = None;
+            let mut forward_record = Record::new();
+            let mut reverse_record = Record::new();
+            loop {
+                let next_forward = next_group_records_read(
+                    &mut forward_reader,
+                    &mut forward_pending,
+                    &mut forward_record,
+                    &mut forward_reader_stats,
+                )?;
+                let next_reverse = next_group_records_read(
+                    &mut reverse_reader,
+                    &mut reverse_pending,
+                    &mut reverse_record,
+                    &mut reverse_reader_stats,
+                )?;
+                let done = handle_direct_group_pair(
+                    next_forward,
+                    next_reverse,
+                    &mut active_batch,
+                    &batch_sender,
+                    &queue_depth,
+                    &max_queue_depth,
+                    &mut batch_enqueue_wait_seconds,
+                    cli.direct_batch_size,
+                    &mut groups_seen,
+                    &mut pair_match_assembly_seconds,
+                )?;
+                if done {
+                    break;
                 }
             }
-            (None, None) => {
-                if !active_batch.is_empty() {
-                    flush_direct_batch(
-                        &mut active_batch,
-                        &batch_sender,
-                        &queue_depth,
-                        &max_queue_depth,
-                        &mut batch_enqueue_wait_seconds,
-                        cli.direct_batch_size,
-                    )?;
-                }
-                break;
-            }
-            _ => bail!("direct input BAMs contained a different number of query-name groups"),
         }
-        pair_match_assembly_seconds += match_start.elapsed().as_secs_f64();
+        DirectReaderMode::DualThreadDiagnostic => {
+            reader_threads_spawned = 2;
+            reader_threads_active_high_watermark = 2;
+            let (forward_tx, forward_rx) = sync_channel::<Result<Option<DirectRecordGroup>>>(2);
+            let (reverse_tx, reverse_rx) = sync_channel::<Result<Option<DirectRecordGroup>>>(2);
+            let forward_handle =
+                thread::spawn(move || read_groups_producer(forward_reader, forward_tx, "forward"));
+            let reverse_handle =
+                thread::spawn(move || read_groups_producer(reverse_reader, reverse_tx, "reverse"));
+            loop {
+                let next_forward = forward_rx
+                    .recv()
+                    .context("failed to receive next forward group")??;
+                let next_reverse = reverse_rx
+                    .recv()
+                    .context("failed to receive next reverse group")??;
+                let done = handle_direct_group_pair(
+                    next_forward,
+                    next_reverse,
+                    &mut active_batch,
+                    &batch_sender,
+                    &queue_depth,
+                    &max_queue_depth,
+                    &mut batch_enqueue_wait_seconds,
+                    cli.direct_batch_size,
+                    &mut groups_seen,
+                    &mut pair_match_assembly_seconds,
+                )?;
+                if done {
+                    break;
+                }
+            }
+            forward_reader_stats = forward_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("forward reader thread panicked"))??;
+            reverse_reader_stats = reverse_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("reverse reader thread panicked"))??;
+        }
     }
+
+    if cli.direct_reader_mode == DirectReaderMode::Serial {
+        forward_reader_stats.wall_seconds = forward_reader_stats.decode_seconds;
+        reverse_reader_stats.wall_seconds = reverse_reader_stats.decode_seconds;
+    }
+
     let read_match_seconds = read_match_start.elapsed().as_secs_f64();
-    let read_decode_seconds = forward_read_decode_seconds + reverse_read_decode_seconds;
+    let read_decode_seconds =
+        forward_reader_stats.decode_seconds + reverse_reader_stats.decode_seconds;
     let qname_group_seconds =
         (read_match_seconds - read_decode_seconds - pair_match_assembly_seconds).max(0.0);
     drop(batch_sender);
+    drop(shared_bgzf_pool);
+    drop(forward_bgzf_pool);
+    drop(reverse_bgzf_pool);
+    drop(output_bgzf_pool);
     let writer_wait_start = Instant::now();
     let writer_stats = writer_handle
         .join()
@@ -604,6 +713,16 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let batches_processed = writer_stats.batches_processed;
     let total_batch_size = writer_stats.total_batch_size;
     let max_batch_size = writer_stats.max_batch_size;
+    let forward_decode_rps = if forward_reader_stats.wall_seconds > 0.0 {
+        forward_reader_stats.records_decoded as f64 / forward_reader_stats.wall_seconds
+    } else {
+        0.0
+    };
+    let reverse_decode_rps = if reverse_reader_stats.wall_seconds > 0.0 {
+        reverse_reader_stats.records_decoded as f64 / reverse_reader_stats.wall_seconds
+    } else {
+        0.0
+    };
 
     if write_call_seconds > process_seconds && stats.final_pairs > 0 {
         stage_log(
@@ -627,8 +746,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
             stats.mismatched,
             read_match_seconds,
             read_decode_seconds,
-            forward_read_decode_seconds,
-            reverse_read_decode_seconds,
+            forward_reader_stats.decode_seconds,
+            reverse_reader_stats.decode_seconds,
             qname_group_seconds,
             pair_match_assembly_seconds,
             writer_recv_wait_seconds,
@@ -636,6 +755,20 @@ fn run_direct(cli: &Cli) -> Result<()> {
             process_seconds,
             write_call_seconds,
             output_drop_close_seconds
+        ),
+    );
+    stage_log(
+        cli,
+        format!(
+            "STAGE direct_reader_diagnostics forward_reader_wall_seconds={:.6} reverse_reader_wall_seconds={:.6} forward_records_decoded={} reverse_records_decoded={} forward_decode_records_per_second={:.3} reverse_decode_records_per_second={:.3} reader_threads_spawned={} reader_threads_active_high_watermark={}",
+            forward_reader_stats.wall_seconds,
+            reverse_reader_stats.wall_seconds,
+            forward_reader_stats.records_decoded,
+            reverse_reader_stats.records_decoded,
+            forward_decode_rps,
+            reverse_decode_rps,
+            reader_threads_spawned,
+            reader_threads_active_high_watermark
         ),
     );
     stage_log(
@@ -673,10 +806,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE flush_finalize_seconds pairs={} seconds={:.6} output_drop_close_seconds={:.6} output={} output_mb={:.3}",
+            "STAGE flush_finalize_seconds pairs={} seconds={:.6} output_drop_close_seconds={:.6} bgzf_flush_seconds={:.6} hts_close_seconds={:.6} file_sync_or_drop_seconds={:.6} output={} output_mb={:.3}",
             stats.final_pairs,
             finalize_start.elapsed().as_secs_f64(),
             output_drop_close_seconds,
+            writer_stats.bgzf_flush_seconds,
+            writer_stats.hts_close_seconds,
+            writer_stats.file_sync_or_drop_seconds,
             cli.output.display(),
             size_mb(&cli.output)?
         ),
@@ -717,6 +853,92 @@ fn flush_direct_batch(
     }
     *batch_enqueue_wait_seconds += enqueue_start.elapsed().as_secs_f64();
     Ok(())
+}
+
+fn handle_direct_group_pair(
+    next_forward: Option<DirectRecordGroup>,
+    next_reverse: Option<DirectRecordGroup>,
+    active_batch: &mut Vec<(DirectRecordGroup, DirectRecordGroup)>,
+    batch_sender: &SyncSender<DirectInputBatch>,
+    queue_depth: &Arc<AtomicUsize>,
+    max_queue_depth: &Arc<AtomicUsize>,
+    batch_enqueue_wait_seconds: &mut f64,
+    direct_batch_size: usize,
+    groups_seen: &mut u64,
+    pair_match_assembly_seconds: &mut f64,
+) -> Result<bool> {
+    let match_start = Instant::now();
+    match (next_forward, next_reverse) {
+        (Some(f_group), Some(r_group)) => {
+            if f_group.qname() != r_group.qname() {
+                bail!(
+                    "direct group name mismatch at group {}: forward={} reverse={}",
+                    *groups_seen + active_batch.len() as u64 + 1,
+                    String::from_utf8_lossy(f_group.qname()),
+                    String::from_utf8_lossy(r_group.qname())
+                );
+            }
+            active_batch.push((f_group, r_group));
+            *groups_seen += 1;
+            if active_batch.len() >= direct_batch_size {
+                flush_direct_batch(
+                    active_batch,
+                    batch_sender,
+                    queue_depth,
+                    max_queue_depth,
+                    batch_enqueue_wait_seconds,
+                    direct_batch_size,
+                )?;
+            }
+        }
+        (None, None) => {
+            if !active_batch.is_empty() {
+                flush_direct_batch(
+                    active_batch,
+                    batch_sender,
+                    queue_depth,
+                    max_queue_depth,
+                    batch_enqueue_wait_seconds,
+                    direct_batch_size,
+                )?;
+            }
+            *pair_match_assembly_seconds += match_start.elapsed().as_secs_f64();
+            return Ok(true);
+        }
+        _ => bail!("direct input BAMs contained a different number of query-name groups"),
+    }
+    *pair_match_assembly_seconds += match_start.elapsed().as_secs_f64();
+    Ok(false)
+}
+
+fn read_groups_producer(
+    mut reader: bam::Reader,
+    sender: SyncSender<Result<Option<DirectRecordGroup>>>,
+    label: &'static str,
+) -> Result<ReaderDecodeStats> {
+    let wall_start = Instant::now();
+    let mut stats = ReaderDecodeStats::default();
+    let mut pending = None;
+    let mut scratch = Record::new();
+    loop {
+        let next =
+            match next_group_records_read(&mut reader, &mut pending, &mut scratch, &mut stats) {
+                Ok(next) => next,
+                Err(e) => {
+                    let _ = sender.send(Err(e));
+                    break;
+                }
+            };
+        let done = next.is_none();
+        sender
+            .send(Ok(next))
+            .with_context(|| format!("failed to send {label} group from producer"))?;
+        if done {
+            break;
+        }
+    }
+    stats.wall_seconds = wall_start.elapsed().as_secs_f64();
+    Ok(stats)
 }
 
 fn direct_writer_thread(
@@ -763,6 +985,10 @@ fn direct_writer_thread(
     let output_drop_start = Instant::now();
     drop(output);
     worker_stats.output_drop_close_seconds = output_drop_start.elapsed().as_secs_f64();
+    worker_stats.hts_close_seconds = worker_stats.output_drop_close_seconds;
+    let sync_start = Instant::now();
+    worker_stats.file_sync_or_drop_seconds = sync_start.elapsed().as_secs_f64();
+    worker_stats.bgzf_flush_seconds = 0.0;
     Ok(worker_stats)
 }
 
@@ -1196,7 +1422,7 @@ fn next_group_records_read(
     reader: &mut bam::Reader,
     pending: &mut Option<Record>,
     scratch: &mut Record,
-    read_decode_seconds: &mut f64,
+    reader_stats: &mut ReaderDecodeStats,
 ) -> Result<Option<DirectRecordGroup>> {
     let decode_start = Instant::now();
     let first = if let Some(record) = pending.take() {
@@ -1211,6 +1437,7 @@ fn next_group_records_read(
         }
     };
     let mut group = DirectRecordGroup::new(first);
+    reader_stats.records_decoded += 1;
     loop {
         match reader.read(scratch) {
             Some(read_result) => {
@@ -1218,6 +1445,7 @@ fn next_group_records_read(
                 let next = std::mem::replace(scratch, Record::new());
                 if next.qname() == group.qname() {
                     group.push_same_qname(next);
+                    reader_stats.records_decoded += 1;
                 } else {
                     *pending = Some(next);
                     break;
@@ -1226,7 +1454,7 @@ fn next_group_records_read(
             None => break,
         }
     }
-    *read_decode_seconds += decode_start.elapsed().as_secs_f64();
+    reader_stats.decode_seconds += decode_start.elapsed().as_secs_f64();
     Ok(Some(group))
 }
 
@@ -1397,6 +1625,52 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
         assigned_threads,
         unused_threads,
         htslib_pool_enabled,
+    }
+}
+
+fn resolve_split_bgzf_workers(total_bgzf_workers: usize) -> SplitBgzfWorkers {
+    if total_bgzf_workers == 0 {
+        return SplitBgzfWorkers::default();
+    }
+    if total_bgzf_workers == 1 {
+        return SplitBgzfWorkers {
+            forward: 1,
+            reverse: 0,
+            output: 0,
+        };
+    }
+    if total_bgzf_workers == 2 {
+        return SplitBgzfWorkers {
+            forward: 1,
+            reverse: 1,
+            output: 0,
+        };
+    }
+    let mut output = (total_bgzf_workers / 10).max(1);
+    if output >= total_bgzf_workers {
+        output = total_bgzf_workers - 1;
+    }
+    let reader_budget = total_bgzf_workers - output;
+    let forward = reader_budget / 2;
+    let reverse = reader_budget - forward;
+    SplitBgzfWorkers {
+        forward,
+        reverse,
+        output,
+    }
+}
+
+fn direct_htslib_pool_mode_name(mode: &DirectHtslibPoolMode) -> &'static str {
+    match mode {
+        DirectHtslibPoolMode::Shared => "shared",
+        DirectHtslibPoolMode::SplitPerHandle => "split_per_handle",
+    }
+}
+
+fn direct_reader_mode_name(mode: &DirectReaderMode) -> &'static str {
+    match mode {
+        DirectReaderMode::Serial => "serial",
+        DirectReaderMode::DualThreadDiagnostic => "dual_thread_diagnostic",
     }
 }
 
