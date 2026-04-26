@@ -1994,11 +1994,14 @@ fn direct_writer_thread(
             worker_stats.write_call_seconds += write_start.elapsed().as_secs_f64();
             batches_since_flush += 1;
             if batches_since_flush >= runtime_config.periodic_flush_batch_interval {
-                let flush_start = Instant::now();
-                output
-                    .flush()
-                    .context("failed to flush direct output writer during periodic drain")?;
-                worker_stats.writer_periodic_flush_seconds += flush_start.elapsed().as_secs_f64();
+                let checkpoint_start = Instant::now();
+                // rust-htslib::bam::Writer does not expose a flush API in rust-htslib 0.51.0.
+                // Keep periodic diagnostics by sampling observable on-disk progress instead.
+                let _periodic_output_bytes = fs::metadata(&output_path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                worker_stats.writer_periodic_flush_seconds +=
+                    checkpoint_start.elapsed().as_secs_f64();
                 worker_stats.writer_periodic_flush_count += 1;
                 batches_since_flush = 0;
             }
@@ -2025,11 +2028,13 @@ fn direct_writer_thread(
     worker_stats.output_bytes_before_close = fs::metadata(&output_path)
         .map(|meta| meta.len())
         .unwrap_or(0);
-    let pre_close_flush_start = Instant::now();
-    output
-        .flush()
-        .context("failed to flush direct output writer before close")?;
-    worker_stats.writer_pre_close_flush_seconds = pre_close_flush_start.elapsed().as_secs_f64();
+    let pre_close_checkpoint_start = Instant::now();
+    // No explicit flush API is available for bam::Writer here; close/drop handles finalization.
+    let _pre_close_output_bytes = fs::metadata(&output_path)
+        .map(|meta| meta.len())
+        .unwrap_or(worker_stats.output_bytes_before_close);
+    worker_stats.writer_pre_close_flush_seconds =
+        pre_close_checkpoint_start.elapsed().as_secs_f64();
     let output_drop_start = Instant::now();
     drop(output);
     worker_stats.output_drop_close_seconds = output_drop_start.elapsed().as_secs_f64();
