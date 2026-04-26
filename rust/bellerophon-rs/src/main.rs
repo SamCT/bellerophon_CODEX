@@ -26,12 +26,14 @@ enum Pipeline {
 #[derive(Clone, Debug, ValueEnum, Eq, PartialEq)]
 enum DirectHtslibPoolMode {
     Shared,
+    #[value(name = "split-per-handle")]
     SplitPerHandle,
 }
 
 #[derive(Clone, Debug, ValueEnum, Eq, PartialEq)]
 enum DirectReaderMode {
     Serial,
+    #[value(name = "dual-thread-diagnostic")]
     DualThreadDiagnostic,
 }
 
@@ -71,10 +73,20 @@ struct Cli {
     #[arg(long = "direct-batch-size", default_value_t = 1024)]
     direct_batch_size: usize,
     /// HTSlib BGZF pool wiring mode for direct pipeline diagnostics.
-    #[arg(long = "direct-htslib-pool-mode", value_enum, default_value = "shared")]
+    #[arg(
+        long = "direct-htslib-pool-mode",
+        value_enum,
+        default_value = "shared",
+        help = "HTSlib BGZF pool mode. 'split-per-handle' is experimental and slower/pathological on current HPC evidence."
+    )]
     direct_htslib_pool_mode: DirectHtslibPoolMode,
     /// Reader execution mode for direct pipeline diagnostics.
-    #[arg(long = "direct-reader-mode", value_enum, default_value = "serial")]
+    #[arg(
+        long = "direct-reader-mode",
+        value_enum,
+        default_value = "serial",
+        help = "Reader mode. 'dual-thread-diagnostic' is experimental diagnostic-only and not production tuned."
+    )]
     direct_reader_mode: DirectReaderMode,
     #[arg(long = "tmp-dir", default_value = ".")]
     tmp_dir: PathBuf,
@@ -168,6 +180,8 @@ struct DirectWorkerStats {
     batches_processed: u64,
     total_batch_size: u64,
     max_batch_size: usize,
+    records_written: u64,
+    estimated_uncompressed_bytes_written: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -490,6 +504,20 @@ fn run_direct(cli: &Cli) -> Result<()> {
             ),
         );
     }
+    if cli.direct_htslib_pool_mode == DirectHtslibPoolMode::SplitPerHandle {
+        stage_log(
+            cli,
+            "STAGE direct_experimental_mode mode=direct_htslib_pool_mode value=split_per_handle note=experimental_slower_or_pathological_in_current_hpc_matrix"
+                .to_string(),
+        );
+    }
+    if cli.direct_reader_mode == DirectReaderMode::DualThreadDiagnostic {
+        stage_log(
+            cli,
+            "STAGE direct_experimental_mode mode=direct_reader_mode value=dual_thread_diagnostic note=diagnostic_only_not_default_and_not_performance_tuned"
+                .to_string(),
+        );
+    }
 
     if cli.direct_batch_size == 0 {
         bail!("--direct-batch-size must be at least 1");
@@ -693,6 +721,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
         forward_reader_stats.decode_seconds + reverse_reader_stats.decode_seconds;
     let qname_group_seconds =
         (read_match_seconds - read_decode_seconds - pair_match_assembly_seconds).max(0.0);
+    let pending_batches_before_close = queue_depth.load(Ordering::Relaxed);
     drop(batch_sender);
     drop(shared_bgzf_pool);
     drop(forward_bgzf_pool);
@@ -791,14 +820,30 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} max_queue_depth={} producer_blocked_seconds={:.6} writer_idle_seconds={:.6} batches_processed={} average_batch_size={:.3} max_batch_size={}",
+            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} max_queue_depth={} producer_blocked_seconds={:.6} writer_idle_seconds={:.6} batches_processed={} average_batch_size={:.3} max_batch_size={} pending_batches_before_close={} records_written={} estimated_uncompressed_bytes_written={} bgzf_worker_utilization=not_exposed_by_htslib_api",
             writer_recv_wait_seconds,
             max_queue_depth,
             batch_enqueue_wait_seconds,
             writer_idle_seconds,
             batches_processed,
             average_batch_size,
-            max_batch_size
+            max_batch_size,
+            pending_batches_before_close,
+            writer_stats.records_written,
+            writer_stats.estimated_uncompressed_bytes_written
+        ),
+    );
+    stage_log(
+        cli,
+        format!(
+            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note=high_ratio_suggests_writer_backlog_flushed_during_close",
+            write_call_seconds,
+            writer_stats.hts_close_seconds,
+            if write_call_seconds > 0.0 {
+                writer_stats.hts_close_seconds / write_call_seconds
+            } else {
+                0.0
+            }
         ),
     );
 
@@ -977,6 +1022,9 @@ fn direct_writer_thread(
             output
                 .write(r_record)
                 .context("failed to write direct output reverse record")?;
+            worker_stats.records_written += 2;
+            worker_stats.estimated_uncompressed_bytes_written +=
+                (f_record.data().len() + r_record.data().len()) as u64;
         }
         worker_stats.write_call_seconds += write_start.elapsed().as_secs_f64();
     }
@@ -1608,8 +1656,20 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
     let total_bgzf_workers = resolved_total_threads
         .saturating_sub(compute_workers)
         .max(1);
-    let shared_pool_intended_per_reader_bgzf_workers = 0;
-    let shared_pool_intended_writer_bgzf_workers = 0;
+    let (shared_pool_intended_per_reader_bgzf_workers, shared_pool_intended_writer_bgzf_workers) =
+        if total_bgzf_workers <= 1 {
+            (0, total_bgzf_workers)
+        } else {
+            let per_reader = (total_bgzf_workers / 5).max(1);
+            let mut writer = total_bgzf_workers.saturating_sub(per_reader * 2);
+            if writer == 0 {
+                writer = 1;
+            }
+            if writer <= per_reader {
+                writer = per_reader + 1;
+            }
+            (per_reader, writer.min(total_bgzf_workers))
+        };
     let assigned_threads = total_bgzf_workers + compute_workers;
     let unused_threads = resolved_total_threads.saturating_sub(assigned_threads);
 
