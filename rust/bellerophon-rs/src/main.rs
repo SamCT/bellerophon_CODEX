@@ -51,6 +51,9 @@ struct Cli {
     log_level: LogLevel,
     #[arg(long = "pipeline", value_enum, hide = true, default_value = "direct")]
     pipeline: Pipeline,
+    /// Number of query-name groups per direct pipeline batch.
+    #[arg(long = "direct-batch-size", default_value_t = 1024)]
+    direct_batch_size: usize,
     #[arg(long = "tmp-dir", default_value = ".")]
     tmp_dir: PathBuf,
 }
@@ -98,8 +101,8 @@ struct DirectThreadResolution {
     explicit_user_cap: Option<usize>,
     resolved_total_threads: usize,
     total_bgzf_workers: usize,
-    per_reader_bgzf_workers: usize,
-    writer_bgzf_workers: usize,
+    shared_pool_intended_per_reader_bgzf_workers: usize,
+    shared_pool_intended_writer_bgzf_workers: usize,
     compute_workers: usize,
     assigned_threads: usize,
     unused_threads: usize,
@@ -132,8 +135,10 @@ struct DirectOutputBatch {
 #[derive(Default)]
 struct DirectWorkerStats {
     pair_stats: PairFilterStats,
+    writer_loop_seconds: f64,
     process_seconds: f64,
-    write_compress_seconds: f64,
+    write_call_seconds: f64,
+    output_drop_close_seconds: f64,
     batches_processed: u64,
     total_batch_size: u64,
     max_batch_size: usize,
@@ -394,7 +399,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_thread_resolution requested_threads={} detected_available_parallelism={} explicit_user_cap={} resolved_total_threads={} total_bgzf_workers={} per_reader_bgzf_workers={} writer_bgzf_workers={} compute_workers={} assigned_threads={} unused_threads={} htslib_pool_enabled={}",
+            "STAGE direct_thread_resolution requested_threads={} detected_available_parallelism={} explicit_user_cap={} resolved_total_threads={} shared_bgzf_pool_workers={} shared_pool_intended_per_reader_bgzf_workers={} shared_pool_intended_writer_bgzf_workers={} compute_workers={} assigned_threads={} unused_threads={} htslib_pool_enabled={}",
             thread_resolution.requested_threads,
             thread_resolution.detected_available_parallelism,
             thread_resolution
@@ -403,8 +408,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 .unwrap_or_else(|| "none".to_string()),
             thread_resolution.resolved_total_threads,
             thread_resolution.total_bgzf_workers,
-            thread_resolution.per_reader_bgzf_workers,
-            thread_resolution.writer_bgzf_workers,
+            thread_resolution.shared_pool_intended_per_reader_bgzf_workers,
+            thread_resolution.shared_pool_intended_writer_bgzf_workers,
             thread_resolution.compute_workers,
             thread_resolution.assigned_threads,
             thread_resolution.unused_threads,
@@ -444,6 +449,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 thread_resolution.unused_threads
             ),
         );
+    }
+
+    if cli.direct_batch_size == 0 {
+        bail!("--direct-batch-size must be at least 1");
     }
 
     let mut forward_reader = bam::Reader::from_path(&cli.forward)
@@ -486,10 +495,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} compression_level={} htslib_pool_enabled={}",
+            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={}",
             setup_start.elapsed().as_secs_f64(),
             thread_resolution.total_bgzf_workers,
             thread_resolution.compute_workers,
+            cli.direct_batch_size,
             cli.compression_level
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "htslib_default".to_string()),
@@ -511,7 +521,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let mut reverse_pending = None;
     let mut forward_record = Record::new();
     let mut reverse_record = Record::new();
-    let mut active_batch: Vec<(DirectRecordGroup, DirectRecordGroup)> = Vec::with_capacity(1024);
+    let mut active_batch: Vec<(DirectRecordGroup, DirectRecordGroup)> =
+        Vec::with_capacity(cli.direct_batch_size);
 
     loop {
         let next_forward = next_group_records_read(
@@ -539,11 +550,12 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 }
                 active_batch.push((f_group, r_group));
                 groups_seen += 1;
-                if active_batch.len() >= 1024 {
+                if active_batch.len() >= cli.direct_batch_size {
                     flush_direct_batch(
                         &mut active_batch,
                         &batch_sender,
                         &mut batch_enqueue_wait_seconds,
+                        cli.direct_batch_size,
                     )?;
                 }
             }
@@ -553,6 +565,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                         &mut active_batch,
                         &batch_sender,
                         &mut batch_enqueue_wait_seconds,
+                        cli.direct_batch_size,
                     )?;
                 }
                 break;
@@ -572,24 +585,26 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let writer_drain_seconds = writer_wait_start.elapsed().as_secs_f64();
     let stats = writer_stats.pair_stats;
     let process_seconds = writer_stats.process_seconds;
-    let write_compress_seconds = writer_stats.write_compress_seconds;
+    let writer_loop_seconds = writer_stats.writer_loop_seconds;
+    let write_call_seconds = writer_stats.write_call_seconds;
+    let output_drop_close_seconds = writer_stats.output_drop_close_seconds;
     let batches_processed = writer_stats.batches_processed;
     let total_batch_size = writer_stats.total_batch_size;
     let max_batch_size = writer_stats.max_batch_size;
 
-    if write_compress_seconds > process_seconds && stats.final_pairs > 0 {
+    if write_call_seconds > process_seconds && stats.final_pairs > 0 {
         stage_log(
             cli,
             format!(
-                "STAGE direct_saturation reason=write_compress_dominates write_compress_seconds={:.6} process_seconds={:.6} note=consider_faster_storage_or_lower_compression",
-                write_compress_seconds, process_seconds
+                "STAGE direct_saturation reason=write_call_dominates write_call_seconds={:.6} process_seconds={:.6} note=consider_faster_storage_or_lower_compression",
+                write_call_seconds, process_seconds
             ),
         );
     }
     stage_log(
         cli,
         format!(
-            "STAGE direct_process groups={} candidate_pairs={} selected_groups_fwd={} selected_groups_rev={} missing_candidate={} low_mapq={} mismatched={} read_match_seconds={:.6} bam_read_decode_seconds={:.6} qname_group_seconds={:.6} match_assembly_seconds={:.6} process_seconds={:.6} write_compress_seconds={:.6}",
+            "STAGE direct_process groups={} candidate_pairs={} selected_groups_fwd={} selected_groups_rev={} missing_candidate={} low_mapq={} mismatched={} read_match_seconds={:.6} bam_read_decode_seconds={:.6} qname_group_seconds={:.6} match_assembly_seconds={:.6} writer_loop_seconds={:.6} process_seconds={:.6} write_call_seconds={:.6} output_drop_close_seconds={:.6}",
             stats.groups,
             stats.candidate_pairs,
             stats.candidate_groups_fwd,
@@ -601,8 +616,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
             read_decode_seconds,
             qname_group_seconds,
             pair_match_assembly_seconds,
+            writer_loop_seconds,
             process_seconds,
-            write_compress_seconds
+            write_call_seconds,
+            output_drop_close_seconds
         ),
     );
     stage_log(
@@ -639,16 +656,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
     );
 
     let finalize_start = Instant::now();
-    let bgzf_flush_seconds = 0.0f64;
-    let close_seconds = 0.0f64;
     stage_log(
         cli,
         format!(
-            "STAGE flush_finalize_seconds pairs={} seconds={:.6} bgzf_flush_seconds={:.6} close_seconds={:.6} output={} output_mb={:.3}",
+            "STAGE flush_finalize_seconds pairs={} seconds={:.6} output_drop_close_seconds={:.6} output={} output_mb={:.3}",
             stats.final_pairs,
             finalize_start.elapsed().as_secs_f64(),
-            bgzf_flush_seconds,
-            close_seconds,
+            output_drop_close_seconds,
             cli.output.display(),
             size_mb(&cli.output)?
         ),
@@ -660,13 +674,14 @@ fn flush_direct_batch(
     active_batch: &mut Vec<(DirectRecordGroup, DirectRecordGroup)>,
     batch_sender: &SyncSender<DirectInputBatch>,
     batch_enqueue_wait_seconds: &mut f64,
+    direct_batch_size: usize,
 ) -> Result<()> {
     if active_batch.is_empty() {
         return Ok(());
     }
     let enqueue_start = Instant::now();
     let batch = DirectInputBatch {
-        groups: std::mem::replace(active_batch, Vec::with_capacity(1024)),
+        groups: std::mem::replace(active_batch, Vec::with_capacity(direct_batch_size)),
     };
     batch_sender
         .send(batch)
@@ -680,6 +695,7 @@ fn direct_writer_thread(
     mut output: Writer,
     quality: u8,
 ) -> Result<DirectWorkerStats> {
+    let writer_loop_start = Instant::now();
     let mut worker_stats = DirectWorkerStats::default();
     while let Ok(batch) = batch_receiver.recv() {
         worker_stats.batches_processed += 1;
@@ -703,10 +719,13 @@ fn direct_writer_thread(
                 .write(r_record)
                 .context("failed to write direct output reverse record")?;
         }
-        worker_stats.write_compress_seconds += write_start.elapsed().as_secs_f64();
+        worker_stats.write_call_seconds += write_start.elapsed().as_secs_f64();
     }
 
+    worker_stats.writer_loop_seconds = writer_loop_start.elapsed().as_secs_f64();
+    let output_drop_start = Instant::now();
     drop(output);
+    worker_stats.output_drop_close_seconds = output_drop_start.elapsed().as_secs_f64();
     Ok(worker_stats)
 }
 
@@ -1327,8 +1346,9 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
     let mut reader_total_bgzf_workers = (resolved_total_threads / 3).max(2);
     let max_reader_bgzf_workers = total_bgzf_workers.saturating_sub(1);
     reader_total_bgzf_workers = reader_total_bgzf_workers.min(max_reader_bgzf_workers);
-    let per_reader_bgzf_workers = reader_total_bgzf_workers / 2;
-    let writer_bgzf_workers = total_bgzf_workers.saturating_sub(reader_total_bgzf_workers);
+    let shared_pool_intended_per_reader_bgzf_workers = reader_total_bgzf_workers / 2;
+    let shared_pool_intended_writer_bgzf_workers =
+        total_bgzf_workers.saturating_sub(reader_total_bgzf_workers);
     let assigned_threads = total_bgzf_workers + compute_workers;
     let unused_threads = resolved_total_threads.saturating_sub(assigned_threads);
 
@@ -1338,8 +1358,8 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
         explicit_user_cap,
         resolved_total_threads,
         total_bgzf_workers,
-        per_reader_bgzf_workers,
-        writer_bgzf_workers,
+        shared_pool_intended_per_reader_bgzf_workers,
+        shared_pool_intended_writer_bgzf_workers,
         compute_workers,
         assigned_threads,
         unused_threads,
@@ -1661,8 +1681,13 @@ mod tests {
     fn direct_thread_roles_writer_gets_majority_of_bgzf_budget() {
         let resolution = resolve_direct_thread_roles(64);
         if resolution.resolved_total_threads >= 6 {
-            assert!(resolution.writer_bgzf_workers > resolution.per_reader_bgzf_workers);
-            assert!(resolution.writer_bgzf_workers > resolution.compute_workers);
+            assert!(
+                resolution.shared_pool_intended_writer_bgzf_workers
+                    > resolution.shared_pool_intended_per_reader_bgzf_workers
+            );
+            assert!(
+                resolution.shared_pool_intended_writer_bgzf_workers > resolution.compute_workers
+            );
         }
     }
 
@@ -1676,9 +1701,12 @@ mod tests {
     #[test]
     fn direct_thread_roles_allocate_proportional_reader_and_writer_workers() {
         let resolution = resolve_direct_thread_roles(96);
-        assert!(resolution.per_reader_bgzf_workers >= 1);
-        assert!(resolution.writer_bgzf_workers >= 1);
-        assert!(resolution.writer_bgzf_workers > resolution.per_reader_bgzf_workers);
+        assert!(resolution.shared_pool_intended_per_reader_bgzf_workers >= 1);
+        assert!(resolution.shared_pool_intended_writer_bgzf_workers >= 1);
+        assert!(
+            resolution.shared_pool_intended_writer_bgzf_workers
+                > resolution.shared_pool_intended_per_reader_bgzf_workers
+        );
         assert!(resolution.compute_workers >= 1);
         assert_eq!(
             resolution.compute_workers + resolution.total_bgzf_workers,
@@ -1691,8 +1719,14 @@ mod tests {
         let low = resolve_direct_thread_roles(64);
         let high = resolve_direct_thread_roles(128);
         if low.resolved_total_threads == 64 && high.resolved_total_threads == 128 {
-            assert!(high.per_reader_bgzf_workers > low.per_reader_bgzf_workers);
-            assert!(high.writer_bgzf_workers > low.writer_bgzf_workers);
+            assert!(
+                high.shared_pool_intended_per_reader_bgzf_workers
+                    > low.shared_pool_intended_per_reader_bgzf_workers
+            );
+            assert!(
+                high.shared_pool_intended_writer_bgzf_workers
+                    > low.shared_pool_intended_writer_bgzf_workers
+            );
             assert!(high.compute_workers > low.compute_workers);
         }
     }
