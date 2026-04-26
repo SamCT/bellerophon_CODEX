@@ -1312,17 +1312,22 @@ fn resolve_direct_thread_roles(thread_count: usize) -> DirectThreadResolution {
     let explicit_user_cap = None;
     let resolved_total_threads = requested.min(detected_available_parallelism).max(1);
 
-    // Keep direct mode simple and compression-first:
-    // - reserve a minimal compute budget for pair assembly/filtering
-    // - reserve 1 BGZF worker target for each reader when possible
-    // - allocate the rest of BGZF workers to the output writer target
+    // Allocate requested threads proportionally across:
+    // - a small compute budget for pair assembly/filtering
+    // - BGZF workers for the two input readers
+    // - BGZF workers for the output writer
     let htslib_pool_enabled = true;
-    let compute_workers = if resolved_total_threads > 1 { 1 } else { 0 };
+    let mut compute_workers = (resolved_total_threads / 16).max(1);
+    if compute_workers >= resolved_total_threads {
+        compute_workers = resolved_total_threads.saturating_sub(1);
+    }
     let total_bgzf_workers = resolved_total_threads
         .saturating_sub(compute_workers)
         .max(1);
-    let reader_total_bgzf_workers = total_bgzf_workers.saturating_sub(1).min(2);
-    let per_reader_bgzf_workers = if reader_total_bgzf_workers >= 2 { 1 } else { 0 };
+    let mut reader_total_bgzf_workers = (resolved_total_threads / 3).max(2);
+    let max_reader_bgzf_workers = total_bgzf_workers.saturating_sub(1);
+    reader_total_bgzf_workers = reader_total_bgzf_workers.min(max_reader_bgzf_workers);
+    let per_reader_bgzf_workers = reader_total_bgzf_workers / 2;
     let writer_bgzf_workers = total_bgzf_workers.saturating_sub(reader_total_bgzf_workers);
     let assigned_threads = total_bgzf_workers + compute_workers;
     let unused_threads = resolved_total_threads.saturating_sub(assigned_threads);
@@ -1629,7 +1634,7 @@ mod tests {
             resolution.detected_available_parallelism
         );
         assert!(resolution.total_bgzf_workers >= 1);
-        assert!(resolution.compute_workers <= 1);
+        assert!(resolution.compute_workers >= 1);
         assert_eq!(resolution.unused_threads, 0);
         assert_eq!(
             resolution.assigned_threads,
@@ -1656,7 +1661,7 @@ mod tests {
     fn direct_thread_roles_writer_gets_majority_of_bgzf_budget() {
         let resolution = resolve_direct_thread_roles(64);
         if resolution.resolved_total_threads >= 6 {
-            assert!(resolution.writer_bgzf_workers > resolution.per_reader_bgzf_workers * 2);
+            assert!(resolution.writer_bgzf_workers > resolution.per_reader_bgzf_workers);
             assert!(resolution.writer_bgzf_workers > resolution.compute_workers);
         }
     }
@@ -1669,16 +1674,27 @@ mod tests {
     }
 
     #[test]
-    fn direct_thread_roles_allocate_reader_targets_before_writer_remainder() {
-        let resolution = resolve_direct_thread_roles(32);
-        if resolution.total_bgzf_workers >= 3 {
-            assert_eq!(resolution.per_reader_bgzf_workers, 1);
-        }
+    fn direct_thread_roles_allocate_proportional_reader_and_writer_workers() {
+        let resolution = resolve_direct_thread_roles(96);
+        assert!(resolution.per_reader_bgzf_workers >= 1);
         assert!(resolution.writer_bgzf_workers >= 1);
+        assert!(resolution.writer_bgzf_workers > resolution.per_reader_bgzf_workers);
+        assert!(resolution.compute_workers >= 1);
         assert_eq!(
             resolution.compute_workers + resolution.total_bgzf_workers,
             resolution.resolved_total_threads
         );
+    }
+
+    #[test]
+    fn direct_thread_roles_scale_per_reader_workers_with_threads() {
+        let low = resolve_direct_thread_roles(64);
+        let high = resolve_direct_thread_roles(128);
+        if low.resolved_total_threads == 64 && high.resolved_total_threads == 128 {
+            assert!(high.per_reader_bgzf_workers > low.per_reader_bgzf_workers);
+            assert!(high.writer_bgzf_workers > low.writer_bgzf_workers);
+            assert!(high.compute_workers > low.compute_workers);
+        }
     }
 
     #[test]
