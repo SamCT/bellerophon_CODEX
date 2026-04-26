@@ -196,12 +196,17 @@ struct DirectWorkerStats {
 struct ReaderDecodeStats {
     wall_seconds: f64,
     decode_seconds: f64,
+    decode_only_seconds: f64,
+    group_build_seconds: f64,
+    htslib_read_seconds: f64,
     records_decoded: u64,
     send_wait_seconds: f64,
     chunks_sent: u64,
     total_chunk_groups: u64,
     max_chunk_groups: usize,
     queue_full_events: u64,
+    queue_occupancy_sum: u64,
+    queue_occupancy_samples: u64,
 }
 
 #[derive(Debug)]
@@ -213,6 +218,16 @@ struct ReaderChunk {
 struct QueueDepthStats {
     max_depth: usize,
     full_events: u64,
+    occupancy_sum: u64,
+    occupancy_samples: u64,
+}
+
+#[derive(Default, Clone, Debug)]
+struct SyncDiagnostics {
+    wait_for_forward_chunk_seconds: f64,
+    wait_for_reverse_chunk_seconds: f64,
+    match_loop_seconds: f64,
+    output_enqueue_seconds: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -647,6 +662,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let mut reader_threads_active_high_watermark = 1usize;
     let mut output_queue_full_events = 0u64;
     let mut reader_chunk_queue_stats = QueueDepthStats::default();
+    let mut sync_diagnostics = SyncDiagnostics::default();
 
     match cli.direct_reader_mode {
         DirectReaderMode::Serial => {
@@ -762,6 +778,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 cli.direct_sync_lookahead_groups,
                 queue_policy.output_queue_capacity,
                 &mut output_queue_full_events,
+                &mut sync_diagnostics,
             )?;
             forward_reader_stats = forward_handle
                 .join()
@@ -774,6 +791,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 .max(reverse_chunk_max_depth.load(Ordering::Relaxed));
             reader_chunk_queue_stats.full_events =
                 forward_reader_stats.queue_full_events + reverse_reader_stats.queue_full_events;
+            reader_chunk_queue_stats.occupancy_sum =
+                forward_reader_stats.queue_occupancy_sum + reverse_reader_stats.queue_occupancy_sum;
+            reader_chunk_queue_stats.occupancy_samples = forward_reader_stats
+                .queue_occupancy_samples
+                + reverse_reader_stats.queue_occupancy_samples;
         }
     }
 
@@ -785,6 +807,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let read_match_seconds = read_match_start.elapsed().as_secs_f64();
     let read_decode_seconds =
         forward_reader_stats.decode_seconds + reverse_reader_stats.decode_seconds;
+    let forward_reader_decode_only_seconds = forward_reader_stats.decode_only_seconds;
+    let reverse_reader_decode_only_seconds = reverse_reader_stats.decode_only_seconds;
     let qname_group_seconds =
         (read_match_seconds - read_decode_seconds - pair_match_assembly_seconds).max(0.0);
     let pending_batches_before_close = queue_depth.load(Ordering::Relaxed);
@@ -867,11 +891,17 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_reader_diagnostics forward_reader_wall_seconds={:.6} reverse_reader_wall_seconds={:.6} reader_decode_wall_seconds={:.6} reader_decode_thread_seconds={:.6} forward_records_decoded={} reverse_records_decoded={} forward_decode_records_per_second={:.3} reverse_decode_records_per_second={:.3} reader_threads_spawned={} reader_threads_active_high_watermark={}",
+            "STAGE direct_reader_diagnostics forward_reader_wall_seconds={:.6} reverse_reader_wall_seconds={:.6} reader_decode_wall_seconds={:.6} reader_decode_thread_seconds={:.6} forward_reader_decode_only_seconds={:.6} reverse_reader_decode_only_seconds={:.6} forward_reader_group_build_seconds={:.6} reverse_reader_group_build_seconds={:.6} forward_reader_htslib_read_seconds={:.6} reverse_reader_htslib_read_seconds={:.6} forward_records_decoded={} reverse_records_decoded={} forward_decode_records_per_second={:.3} reverse_decode_records_per_second={:.3} reader_threads_spawned={} reader_threads_active_high_watermark={}",
             forward_reader_stats.wall_seconds,
             reverse_reader_stats.wall_seconds,
             reader_decode_wall_seconds,
             reader_decode_thread_seconds,
+            forward_reader_decode_only_seconds,
+            reverse_reader_decode_only_seconds,
+            forward_reader_stats.group_build_seconds,
+            reverse_reader_stats.group_build_seconds,
+            forward_reader_stats.htslib_read_seconds,
+            reverse_reader_stats.htslib_read_seconds,
             forward_reader_stats.records_decoded,
             reverse_reader_stats.records_decoded,
             forward_decode_rps,
@@ -920,10 +950,16 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let max_chunk_groups = forward_reader_stats
         .max_chunk_groups
         .max(reverse_reader_stats.max_chunk_groups);
+    let reader_chunk_queue_occupancy_mean = if reader_chunk_queue_stats.occupancy_samples > 0 {
+        reader_chunk_queue_stats.occupancy_sum as f64
+            / reader_chunk_queue_stats.occupancy_samples as f64
+    } else {
+        0.0
+    };
     stage_log(
         cli,
         format!(
-            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
+            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
             writer_recv_wait_seconds,
             max_queue_depth,
             queue_policy.output_queue_capacity,
@@ -934,6 +970,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
             forward_reader_stats.send_wait_seconds,
             reverse_reader_stats.send_wait_seconds,
             writer_idle_seconds,
+            sync_diagnostics.wait_for_forward_chunk_seconds,
+            sync_diagnostics.wait_for_reverse_chunk_seconds,
+            sync_diagnostics.match_loop_seconds,
+            sync_diagnostics.output_enqueue_seconds,
             batches_processed,
             writer_receive_count,
             average_batch_size,
@@ -954,6 +994,9 @@ fn run_direct(cli: &Cli) -> Result<()> {
             output_queue_full_events + reader_chunk_queue_stats.full_events,
             average_chunk_groups,
             max_chunk_groups,
+            reader_chunk_queue_occupancy_mean,
+            forward_reader_stats.chunks_sent,
+            reverse_reader_stats.chunks_sent,
             queue_policy.output_queue_capacity,
             queue_policy.reader_queue_capacity,
             queue_policy.reader_chunk_groups,
@@ -1151,6 +1194,8 @@ fn read_group_chunks_producer(
                 .with_context(|| format!("failed to send {label} EOF from producer"))?;
             stats.send_wait_seconds += send_start.elapsed().as_secs_f64();
             let depth = chunk_queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+            stats.queue_occupancy_sum += depth as u64;
+            stats.queue_occupancy_samples += 1;
             loop {
                 let previous_max = chunk_queue_max_depth.load(Ordering::Relaxed);
                 if depth <= previous_max {
@@ -1178,6 +1223,8 @@ fn read_group_chunks_producer(
         stats.total_chunk_groups += group_count as u64;
         stats.max_chunk_groups = stats.max_chunk_groups.max(group_count);
         let depth = chunk_queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        stats.queue_occupancy_sum += depth as u64;
+        stats.queue_occupancy_samples += 1;
         loop {
             let previous_max = chunk_queue_max_depth.load(Ordering::Relaxed);
             if depth <= previous_max {
@@ -1212,6 +1259,7 @@ fn sync_parallel_reader_groups(
     max_lookahead_groups: usize,
     matcher_output_queue_capacity: usize,
     output_queue_full_events: &mut u64,
+    sync_diagnostics: &mut SyncDiagnostics,
 ) -> Result<()> {
     let mut forward_queue: VecDeque<DirectRecordGroup> = VecDeque::new();
     let mut reverse_queue: VecDeque<DirectRecordGroup> = VecDeque::new();
@@ -1222,10 +1270,12 @@ fn sync_parallel_reader_groups(
 
     loop {
         if !forward_done && forward_queue.is_empty() {
-            match forward_rx
+            let wait_start = Instant::now();
+            let next_forward_chunk = forward_rx
                 .recv()
-                .context("failed to receive forward chunk")??
-            {
+                .context("failed to receive forward chunk")??;
+            sync_diagnostics.wait_for_forward_chunk_seconds += wait_start.elapsed().as_secs_f64();
+            match next_forward_chunk {
                 Some(chunk) => {
                     forward_chunk_depth.fetch_sub(1, Ordering::Relaxed);
                     for group in chunk.groups {
@@ -1239,10 +1289,12 @@ fn sync_parallel_reader_groups(
             }
         }
         if !reverse_done && reverse_queue.is_empty() {
-            match reverse_rx
+            let wait_start = Instant::now();
+            let next_reverse_chunk = reverse_rx
                 .recv()
-                .context("failed to receive reverse chunk")??
-            {
+                .context("failed to receive reverse chunk")??;
+            sync_diagnostics.wait_for_reverse_chunk_seconds += wait_start.elapsed().as_secs_f64();
+            match next_reverse_chunk {
                 Some(chunk) => {
                     reverse_chunk_depth.fetch_sub(1, Ordering::Relaxed);
                     for group in chunk.groups {
@@ -1265,6 +1317,7 @@ fn sync_parallel_reader_groups(
                     active_batch.push((f_group, r_group));
                     *groups_seen += 1;
                     if active_batch.len() >= direct_batch_size {
+                        let enqueue_start = Instant::now();
                         flush_direct_batch(
                             active_batch,
                             batch_sender,
@@ -1275,6 +1328,8 @@ fn sync_parallel_reader_groups(
                             matcher_output_queue_capacity,
                             output_queue_full_events,
                         )?;
+                        sync_diagnostics.output_enqueue_seconds +=
+                            enqueue_start.elapsed().as_secs_f64();
                     }
                 }
                 CmpOrdering::Less => {
@@ -1284,6 +1339,7 @@ fn sync_parallel_reader_groups(
                         active_batch.push((f_group, r_group));
                         *groups_seen += 1;
                         if active_batch.len() >= direct_batch_size {
+                            let enqueue_start = Instant::now();
                             flush_direct_batch(
                                 active_batch,
                                 batch_sender,
@@ -1294,6 +1350,8 @@ fn sync_parallel_reader_groups(
                                 matcher_output_queue_capacity,
                                 output_queue_full_events,
                             )?;
+                            sync_diagnostics.output_enqueue_seconds +=
+                                enqueue_start.elapsed().as_secs_f64();
                         }
                     } else {
                         if pending_forward.insert(key.clone(), f_group).is_some() {
@@ -1311,6 +1369,7 @@ fn sync_parallel_reader_groups(
                         active_batch.push((f_group, r_group));
                         *groups_seen += 1;
                         if active_batch.len() >= direct_batch_size {
+                            let enqueue_start = Instant::now();
                             flush_direct_batch(
                                 active_batch,
                                 batch_sender,
@@ -1321,6 +1380,8 @@ fn sync_parallel_reader_groups(
                                 matcher_output_queue_capacity,
                                 output_queue_full_events,
                             )?;
+                            sync_diagnostics.output_enqueue_seconds +=
+                                enqueue_start.elapsed().as_secs_f64();
                         }
                     } else {
                         if pending_reverse.insert(key.clone(), r_group).is_some() {
@@ -1332,7 +1393,9 @@ fn sync_parallel_reader_groups(
                     }
                 }
             }
-            *pair_match_assembly_seconds += match_start.elapsed().as_secs_f64();
+            let elapsed = match_start.elapsed().as_secs_f64();
+            *pair_match_assembly_seconds += elapsed;
+            sync_diagnostics.match_loop_seconds += elapsed;
         } else if forward_done
             && reverse_done
             && forward_queue.is_empty()
@@ -1353,6 +1416,7 @@ fn sync_parallel_reader_groups(
         bail!("direct input BAMs contained a different number of query-name groups");
     }
     if !active_batch.is_empty() {
+        let enqueue_start = Instant::now();
         flush_direct_batch(
             active_batch,
             batch_sender,
@@ -1363,6 +1427,7 @@ fn sync_parallel_reader_groups(
             matcher_output_queue_capacity,
             output_queue_full_events,
         )?;
+        sync_diagnostics.output_enqueue_seconds += enqueue_start.elapsed().as_secs_f64();
     }
     Ok(())
 }
@@ -1865,7 +1930,10 @@ fn next_group_records_read(
     let first = if let Some(record) = pending.take() {
         record
     } else {
-        match reader.read(scratch) {
+        let hts_read_start = Instant::now();
+        let read_result = reader.read(scratch);
+        reader_stats.htslib_read_seconds += hts_read_start.elapsed().as_secs_f64();
+        match read_result {
             Some(read_result) => {
                 read_result.context("failed to read BAM record")?;
                 std::mem::replace(scratch, Record::new())
@@ -1873,10 +1941,14 @@ fn next_group_records_read(
             None => return Ok(None),
         }
     };
+    let group_build_start = Instant::now();
     let mut group = DirectRecordGroup::new(first);
     reader_stats.records_decoded += 1;
     loop {
-        match reader.read(scratch) {
+        let hts_read_start = Instant::now();
+        let read_result = reader.read(scratch);
+        reader_stats.htslib_read_seconds += hts_read_start.elapsed().as_secs_f64();
+        match read_result {
             Some(read_result) => {
                 read_result.context("failed to read BAM record")?;
                 let next = std::mem::replace(scratch, Record::new());
@@ -1891,7 +1963,10 @@ fn next_group_records_read(
             None => break,
         }
     }
-    reader_stats.decode_seconds += decode_start.elapsed().as_secs_f64();
+    reader_stats.group_build_seconds += group_build_start.elapsed().as_secs_f64();
+    let decode_elapsed = decode_start.elapsed().as_secs_f64();
+    reader_stats.decode_seconds += decode_elapsed;
+    reader_stats.decode_only_seconds += decode_elapsed;
     Ok(Some(group))
 }
 
@@ -2081,23 +2156,21 @@ fn resolve_direct_queue_policy(requested_threads: usize, cli: &Cli) -> DirectQue
     let bounded_threads = requested_threads.max(1);
     let output_queue_capacity = if bounded_threads <= 32 {
         8
-    } else if bounded_threads <= 64 {
-        16
     } else if bounded_threads <= 128 {
-        32
+        16
     } else {
-        64
+        24
     };
-    let reader_queue_capacity = if bounded_threads <= 64 {
+    let reader_queue_capacity = if bounded_threads <= 128 {
         if cli.direct_reader_chunk_groups >= 1024 {
             4
         } else {
             8
         }
     } else if cli.direct_reader_chunk_groups >= 1024 {
-        8
+        6
     } else {
-        16
+        12
     };
     DirectQueuePolicy {
         output_queue_capacity,
