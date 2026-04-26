@@ -213,6 +213,12 @@ struct DirectWorkerStats {
 #[derive(Clone, Copy, Debug)]
 struct DirectWriterRuntimeConfig {
     periodic_flush_batch_interval: u64,
+    flow_target_backlog_seconds: f64,
+    flow_min_inflight_bytes: u64,
+    flow_max_inflight_bytes: u64,
+    flow_max_queue_backlog_batches: u64,
+    flow_stale_progress_micros: u64,
+    flow_wait_poll_micros: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -227,6 +233,9 @@ struct DirectComputeStats {
     compute_input_wait_wall_seconds: f64,
     compute_output_send_wait_wall_seconds: f64,
     compute_output_queue_full_events: u64,
+    compute_flow_control_wait_thread_seconds_total: f64,
+    compute_flow_control_wait_wall_seconds: f64,
+    compute_flow_control_wait_events: u64,
     compute_to_writer_queue_max_depth: usize,
     per_worker_batches_processed: Vec<u64>,
     per_worker_max_batch_filter_seconds: Vec<f64>,
@@ -249,6 +258,9 @@ struct DirectComputeWorkerStats {
     compute_input_wait_wall_seconds: f64,
     compute_output_send_wait_wall_seconds: f64,
     compute_output_queue_full_events: u64,
+    compute_flow_control_wait_thread_seconds_total: f64,
+    compute_flow_control_wait_wall_seconds: f64,
+    compute_flow_control_wait_events: u64,
     compute_filter_wall_seconds: f64,
     batch_filter_seconds_total: f64,
     max_batch_filter_seconds: f64,
@@ -701,6 +713,15 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let output_queue_submitted = Arc::new(AtomicU64::new(0));
     let output_queue_received = Arc::new(AtomicU64::new(0));
     let output_queue_max_depth = Arc::new(AtomicUsize::new(0));
+    let output_bytes_submitted = Arc::new(AtomicU64::new(0));
+    let output_bytes_written = Arc::new(AtomicU64::new(0));
+    let writer_bytes_per_second_estimate = Arc::new(AtomicU64::new(0));
+    let writer_last_progress_micros = Arc::new(AtomicU64::new(0));
+    let pipeline_start = Instant::now();
+    let writer_runtime_config = resolve_direct_writer_runtime_config(
+        thread_resolution.requested_threads,
+        thread_resolution.shared_pool_intended_writer_bgzf_workers,
+    );
     let ordered_writer_next_expected_batch_id = Arc::new(AtomicU64::new(0));
     let input_batch_receiver = Arc::new(Mutex::new(input_batch_receiver));
     let mut compute_handles = Vec::with_capacity(thread_resolution.compute_workers);
@@ -712,9 +733,15 @@ fn run_direct(cli: &Cli) -> Result<()> {
         let worker_output_queue_submitted = Arc::clone(&output_queue_submitted);
         let worker_output_queue_received = Arc::clone(&output_queue_received);
         let worker_output_queue_max_depth = Arc::clone(&output_queue_max_depth);
+        let worker_output_bytes_submitted = Arc::clone(&output_bytes_submitted);
+        let worker_output_bytes_written = Arc::clone(&output_bytes_written);
+        let worker_writer_bytes_per_second_estimate = Arc::clone(&writer_bytes_per_second_estimate);
+        let worker_writer_last_progress_micros = Arc::clone(&writer_last_progress_micros);
+        let worker_writer_runtime_config = writer_runtime_config;
         let worker_writer_next_expected_batch_id =
             Arc::clone(&ordered_writer_next_expected_batch_id);
         let worker_output_queue_capacity = queue_policy.output_queue_capacity;
+        let worker_pipeline_start = pipeline_start;
         compute_handles.push(thread::spawn(move || {
             direct_compute_thread(
                 worker_id,
@@ -725,18 +752,23 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 worker_output_queue_submitted,
                 worker_output_queue_received,
                 worker_output_queue_max_depth,
+                worker_output_bytes_submitted,
+                worker_output_bytes_written,
+                worker_writer_bytes_per_second_estimate,
+                worker_writer_last_progress_micros,
                 worker_writer_next_expected_batch_id,
                 worker_output_queue_capacity,
+                worker_writer_runtime_config,
+                worker_pipeline_start,
             )
         }));
     }
     drop(output_batch_sender);
     let writer_output_queue_received = Arc::clone(&output_queue_received);
+    let writer_output_bytes_written = Arc::clone(&output_bytes_written);
+    let writer_bytes_per_second_estimate = Arc::clone(&writer_bytes_per_second_estimate);
+    let writer_last_progress_micros = Arc::clone(&writer_last_progress_micros);
     let writer_next_expected_batch_id = Arc::clone(&ordered_writer_next_expected_batch_id);
-    let writer_runtime_config = resolve_direct_writer_runtime_config(
-        thread_resolution.requested_threads,
-        thread_resolution.shared_pool_intended_writer_bgzf_workers,
-    );
     let output_path_for_writer = cli.output.clone();
     let writer_handle = thread::spawn(move || {
         direct_writer_thread(
@@ -744,15 +776,19 @@ fn run_direct(cli: &Cli) -> Result<()> {
             output,
             output_path_for_writer,
             writer_output_queue_received,
+            writer_output_bytes_written,
+            writer_bytes_per_second_estimate,
+            writer_last_progress_micros,
             writer_next_expected_batch_id,
             writer_runtime_config,
+            pipeline_start,
         )
     });
 
     stage_log(
         cli,
         format!(
-            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} writer_periodic_flush_batch_interval={} reader_mode={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_queue_policy=auto_bounded",
+            "STAGE direct_open_setup seconds={:.6} total_bgzf_workers={} compute_workers={} direct_batch_size={} compression_level={} htslib_pool_enabled={} htslib_pool_mode={} split_forward_bgzf_workers={} split_reverse_bgzf_workers={} split_output_bgzf_workers={} writer_periodic_flush_batch_interval={} flow_target_backlog_seconds={:.3} flow_min_inflight_bytes={} flow_max_inflight_bytes={} flow_max_queue_backlog_batches={} reader_mode={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_queue_policy=auto_bounded",
             setup_start.elapsed().as_secs_f64(),
             thread_resolution.total_bgzf_workers,
             thread_resolution.compute_workers,
@@ -766,6 +802,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
             split_workers.reverse,
             split_workers.output,
             writer_runtime_config.periodic_flush_batch_interval,
+            writer_runtime_config.flow_target_backlog_seconds,
+            writer_runtime_config.flow_min_inflight_bytes,
+            writer_runtime_config.flow_max_inflight_bytes,
+            writer_runtime_config.flow_max_queue_backlog_batches,
             direct_reader_mode_name(&cli.direct_reader_mode),
             queue_policy.output_queue_capacity,
             queue_policy.reader_queue_capacity,
@@ -965,6 +1005,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
             .max(worker_stats.compute_output_send_wait_wall_seconds);
         compute_stats.compute_output_queue_full_events +=
             worker_stats.compute_output_queue_full_events;
+        compute_stats.compute_flow_control_wait_thread_seconds_total +=
+            worker_stats.compute_flow_control_wait_thread_seconds_total;
+        compute_stats.compute_flow_control_wait_wall_seconds = compute_stats
+            .compute_flow_control_wait_wall_seconds
+            .max(worker_stats.compute_flow_control_wait_wall_seconds);
+        compute_stats.compute_flow_control_wait_events +=
+            worker_stats.compute_flow_control_wait_events;
         compute_stats.compute_filter_wall_seconds = compute_stats
             .compute_filter_wall_seconds
             .max(worker_stats.compute_filter_wall_seconds);
@@ -1224,7 +1271,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_compute_diagnostics compute_workers={} compute_batches_processed={} compute_records_selected={} compute_filter_seconds_total={:.6} compute_filter_wall_seconds={:.6} compute_input_wait_thread_seconds_total={:.6} compute_output_send_wait_thread_seconds_total={:.6} compute_input_wait_wall_seconds={:.6} compute_output_send_wait_wall_seconds={:.6} compute_output_queue_full_events={} per_worker_batches_processed={} per_worker_max_batch_filter_seconds={} per_worker_mean_batch_filter_seconds={} slowest_batch_id={} slowest_batch_filter_seconds={:.6} compute_batch_duration_p50_seconds={:.6} compute_batch_duration_p95_seconds={:.6} compute_batch_duration_p99_seconds={:.6} ordered_writer_pending_batches_max={} ordered_writer_wait_for_next_batch_seconds={:.6} ordered_writer_missing_batch_wait_events={} ordered_writer_max_gap={} ordered_writer_pending_map_max_size={} ordered_writer_waiting_for_batch_topn={} max_completed_batch_gap_at_writer={} ordered_writer_next_expected_batch_id={} ordered_writer_largest_received_batch_id={} ordered_writer_write_seconds={:.6} ordered_writer_records_per_second={:.3}",
+            "STAGE direct_compute_diagnostics compute_workers={} compute_batches_processed={} compute_records_selected={} compute_filter_seconds_total={:.6} compute_filter_wall_seconds={:.6} compute_input_wait_thread_seconds_total={:.6} compute_output_send_wait_thread_seconds_total={:.6} compute_input_wait_wall_seconds={:.6} compute_output_send_wait_wall_seconds={:.6} compute_output_queue_full_events={} compute_flow_control_wait_thread_seconds_total={:.6} compute_flow_control_wait_wall_seconds={:.6} compute_flow_control_wait_events={} per_worker_batches_processed={} per_worker_max_batch_filter_seconds={} per_worker_mean_batch_filter_seconds={} slowest_batch_id={} slowest_batch_filter_seconds={:.6} compute_batch_duration_p50_seconds={:.6} compute_batch_duration_p95_seconds={:.6} compute_batch_duration_p99_seconds={:.6} ordered_writer_pending_batches_max={} ordered_writer_wait_for_next_batch_seconds={:.6} ordered_writer_missing_batch_wait_events={} ordered_writer_max_gap={} ordered_writer_pending_map_max_size={} ordered_writer_waiting_for_batch_topn={} max_completed_batch_gap_at_writer={} ordered_writer_next_expected_batch_id={} ordered_writer_largest_received_batch_id={} ordered_writer_write_seconds={:.6} ordered_writer_records_per_second={:.3}",
             compute_stats.compute_workers,
             compute_stats.compute_batches_processed,
             compute_stats.compute_records_selected,
@@ -1235,6 +1282,9 @@ fn run_direct(cli: &Cli) -> Result<()> {
             compute_stats.compute_input_wait_wall_seconds,
             compute_stats.compute_output_send_wait_wall_seconds,
             compute_stats.compute_output_queue_full_events,
+            compute_stats.compute_flow_control_wait_thread_seconds_total,
+            compute_stats.compute_flow_control_wait_wall_seconds,
+            compute_stats.compute_flow_control_wait_events,
             format_u64_slice(&compute_stats.per_worker_batches_processed),
             format_f64_slice(&compute_stats.per_worker_max_batch_filter_seconds),
             format_f64_slice(&compute_stats.per_worker_mean_batch_filter_seconds),
@@ -1827,8 +1877,14 @@ fn direct_compute_thread(
     output_queue_submitted: Arc<AtomicU64>,
     output_queue_received: Arc<AtomicU64>,
     output_queue_max_depth: Arc<AtomicUsize>,
+    output_bytes_submitted: Arc<AtomicU64>,
+    output_bytes_written: Arc<AtomicU64>,
+    writer_bytes_per_second_estimate: Arc<AtomicU64>,
+    writer_last_progress_micros: Arc<AtomicU64>,
     writer_next_expected_batch_id: Arc<AtomicU64>,
     output_queue_capacity: usize,
+    runtime_config: DirectWriterRuntimeConfig,
+    pipeline_start: Instant,
 ) -> Result<DirectComputeWorkerStats> {
     const COMPUTE_AHEAD_WINDOW_BATCHES_PER_WORKER: u64 = 2;
     let worker_start = Instant::now();
@@ -1868,21 +1924,28 @@ fn direct_compute_thread(
                 stats
                     .batch_filter_samples_seconds
                     .push(output_batch.filter_seconds);
-                let max_allowed_batch_id = writer_next_expected_batch_id
-                    .load(Ordering::Relaxed)
-                    .saturating_add(
-                        COMPUTE_AHEAD_WINDOW_BATCHES_PER_WORKER * output_queue_capacity as u64,
-                    );
-                while output_batch_id > max_allowed_batch_id {
-                    thread::sleep(Duration::from_micros(100));
-                    let latest_max_allowed_batch_id = writer_next_expected_batch_id
-                        .load(Ordering::Relaxed)
-                        .saturating_add(
-                            COMPUTE_AHEAD_WINDOW_BATCHES_PER_WORKER * output_queue_capacity as u64,
-                        );
-                    if output_batch_id <= latest_max_allowed_batch_id {
-                        break;
-                    }
+                let output_batch_bytes = estimate_output_batch_bytes(&output_batch);
+                while should_throttle_compute_submission(
+                    output_batch_id,
+                    COMPUTE_AHEAD_WINDOW_BATCHES_PER_WORKER * output_queue_capacity as u64,
+                    &writer_next_expected_batch_id,
+                    &output_queue_submitted,
+                    &output_queue_received,
+                    &output_bytes_submitted,
+                    &output_bytes_written,
+                    &writer_bytes_per_second_estimate,
+                    &writer_last_progress_micros,
+                    runtime_config,
+                    pipeline_start,
+                ) {
+                    stats.compute_flow_control_wait_events += 1;
+                    let flow_wait_start = Instant::now();
+                    thread::sleep(Duration::from_micros(
+                        runtime_config.flow_wait_poll_micros.max(25),
+                    ));
+                    let flow_wait_seconds = flow_wait_start.elapsed().as_secs_f64();
+                    stats.compute_flow_control_wait_thread_seconds_total += flow_wait_seconds;
+                    stats.compute_flow_control_wait_wall_seconds += flow_wait_seconds;
                 }
                 let queue_depth_before_send = output_queue_submitted
                     .load(Ordering::Relaxed)
@@ -1897,6 +1960,7 @@ fn direct_compute_thread(
                 let output_wait_seconds = send_wait_start.elapsed().as_secs_f64();
                 stats.compute_output_send_wait_thread_seconds_total += output_wait_seconds;
                 compute_output_send_wait_wall_seconds += output_wait_seconds;
+                output_bytes_submitted.fetch_add(output_batch_bytes, Ordering::Relaxed);
                 let submitted = output_queue_submitted.fetch_add(1, Ordering::Relaxed) + 1;
                 let received = output_queue_received.load(Ordering::Relaxed);
                 let depth = submitted.saturating_sub(received) as usize;
@@ -1922,20 +1986,79 @@ fn direct_compute_thread(
     Ok(stats)
 }
 
+fn estimate_output_batch_bytes(batch: &DirectOutputBatch) -> u64 {
+    batch
+        .records
+        .iter()
+        .map(|(f_record, r_record)| (f_record.inner().l_data + r_record.inner().l_data) as u64)
+        .sum()
+}
+
+fn should_throttle_compute_submission(
+    output_batch_id: u64,
+    writer_window_batches: u64,
+    writer_next_expected_batch_id: &Arc<AtomicU64>,
+    output_queue_submitted: &Arc<AtomicU64>,
+    output_queue_received: &Arc<AtomicU64>,
+    output_bytes_submitted: &Arc<AtomicU64>,
+    output_bytes_written: &Arc<AtomicU64>,
+    writer_bytes_per_second_estimate: &Arc<AtomicU64>,
+    writer_last_progress_micros: &Arc<AtomicU64>,
+    runtime_config: DirectWriterRuntimeConfig,
+    pipeline_start: Instant,
+) -> bool {
+    let max_allowed_batch_id = writer_next_expected_batch_id
+        .load(Ordering::Relaxed)
+        .saturating_add(writer_window_batches);
+    if output_batch_id > max_allowed_batch_id {
+        return true;
+    }
+    let submitted = output_queue_submitted.load(Ordering::Relaxed);
+    let received = output_queue_received.load(Ordering::Relaxed);
+    let queue_backlog_batches = submitted.saturating_sub(received);
+    let backlog_bytes = output_bytes_submitted
+        .load(Ordering::Relaxed)
+        .saturating_sub(output_bytes_written.load(Ordering::Relaxed));
+    let writer_bps = writer_bytes_per_second_estimate.load(Ordering::Relaxed);
+    let dynamic_limit = if writer_bps == 0 {
+        runtime_config.flow_min_inflight_bytes
+    } else {
+        ((writer_bps as f64) * runtime_config.flow_target_backlog_seconds) as u64
+    }
+    .clamp(
+        runtime_config.flow_min_inflight_bytes,
+        runtime_config.flow_max_inflight_bytes,
+    );
+    if backlog_bytes > dynamic_limit {
+        return true;
+    }
+    let last_progress_micros = writer_last_progress_micros.load(Ordering::Relaxed);
+    let now_micros = pipeline_start.elapsed().as_micros() as u64;
+    let stale_writer = now_micros.saturating_sub(last_progress_micros)
+        >= runtime_config.flow_stale_progress_micros;
+    stale_writer && queue_backlog_batches >= runtime_config.flow_max_queue_backlog_batches
+}
+
 fn direct_writer_thread(
     batch_receiver: Receiver<DirectOutputBatch>,
     mut output: Writer,
     output_path: PathBuf,
     output_queue_received: Arc<AtomicU64>,
+    output_bytes_written: Arc<AtomicU64>,
+    writer_bytes_per_second_estimate: Arc<AtomicU64>,
+    writer_last_progress_micros: Arc<AtomicU64>,
     ordered_writer_next_expected_batch_id: Arc<AtomicU64>,
     runtime_config: DirectWriterRuntimeConfig,
+    pipeline_start: Instant,
 ) -> Result<DirectWorkerStats> {
     let writer_loop_start = Instant::now();
+    writer_last_progress_micros.store(0, Ordering::Relaxed);
     let mut worker_stats = DirectWorkerStats::default();
     let mut next_batch_id = 0u64;
     let mut pending: BTreeMap<u64, DirectOutputBatch> = BTreeMap::new();
     let mut waiting_for_batch_counts: HashMap<u64, u64> = HashMap::new();
-    let mut batches_since_flush = 0u64;
+    let mut bytes_since_checkpoint = 0u64;
+    let mut last_checkpoint = Instant::now();
     loop {
         let recv_wait_start = Instant::now();
         let output_batch = match batch_receiver.recv() {
@@ -1980,6 +2103,7 @@ fn direct_writer_thread(
             worker_stats.pair_stats.low_mapq += batch.stats.low_mapq;
             worker_stats.pair_stats.final_pairs += batch.stats.final_pairs;
             let write_start = Instant::now();
+            let mut batch_bytes_written = 0u64;
             for (f_record, r_record) in &batch.records {
                 output
                     .write(f_record)
@@ -1988,12 +2112,34 @@ fn direct_writer_thread(
                     .write(r_record)
                     .context("failed to write direct output reverse record")?;
                 worker_stats.records_written += 2;
-                worker_stats.estimated_uncompressed_bytes_written +=
-                    (f_record.inner().l_data + r_record.inner().l_data) as u64;
+                let pair_bytes = (f_record.inner().l_data + r_record.inner().l_data) as u64;
+                worker_stats.estimated_uncompressed_bytes_written += pair_bytes;
+                batch_bytes_written += pair_bytes;
             }
-            worker_stats.write_call_seconds += write_start.elapsed().as_secs_f64();
-            batches_since_flush += 1;
-            if batches_since_flush >= runtime_config.periodic_flush_batch_interval {
+            let batch_write_seconds = write_start.elapsed().as_secs_f64();
+            worker_stats.write_call_seconds += batch_write_seconds;
+            output_bytes_written.fetch_add(batch_bytes_written, Ordering::Relaxed);
+            writer_last_progress_micros.store(
+                pipeline_start.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
+            if batch_write_seconds > 0.0 && batch_bytes_written > 0 {
+                let instant_bps = (batch_bytes_written as f64 / batch_write_seconds) as u64;
+                let previous_bps = writer_bytes_per_second_estimate.load(Ordering::Relaxed);
+                let next_bps = if previous_bps == 0 {
+                    instant_bps
+                } else {
+                    ((previous_bps * 7) + instant_bps) / 8
+                };
+                writer_bytes_per_second_estimate.store(next_bps, Ordering::Relaxed);
+            }
+            bytes_since_checkpoint = bytes_since_checkpoint.saturating_add(batch_bytes_written);
+            let should_checkpoint = bytes_since_checkpoint
+                >= (runtime_config.flow_min_inflight_bytes / 2).max(1)
+                || last_checkpoint.elapsed().as_secs_f64()
+                    >= runtime_config.flow_target_backlog_seconds
+                || pending.len() as u64 >= runtime_config.flow_max_queue_backlog_batches;
+            if should_checkpoint {
                 let checkpoint_start = Instant::now();
                 // rust-htslib::bam::Writer does not expose a flush API in rust-htslib 0.51.0.
                 // Keep periodic diagnostics by sampling observable on-disk progress instead.
@@ -2003,7 +2149,8 @@ fn direct_writer_thread(
                 worker_stats.writer_periodic_flush_seconds +=
                     checkpoint_start.elapsed().as_secs_f64();
                 worker_stats.writer_periodic_flush_count += 1;
-                batches_since_flush = 0;
+                bytes_since_checkpoint = 0;
+                last_checkpoint = Instant::now();
             }
             next_batch_id += 1;
             ordered_writer_next_expected_batch_id.store(next_batch_id, Ordering::Relaxed);
@@ -2797,8 +2944,22 @@ fn resolve_direct_writer_runtime_config(
     let base_interval = (2048u64 / writer_workers).max(8);
     let thread_bias = (bounded_threads / 16).max(1);
     let periodic_flush_batch_interval = (base_interval / thread_bias).clamp(4, 256);
+    let flow_target_backlog_seconds = if bounded_threads >= 64 { 0.18 } else { 0.24 };
+    let flow_min_inflight_bytes = (8 * 1024 * 1024u64).saturating_mul(writer_workers.min(8));
+    let flow_max_inflight_bytes = (64 * 1024 * 1024u64)
+        .saturating_mul(writer_workers.max(1))
+        .min(1024 * 1024 * 1024u64);
+    let flow_max_queue_backlog_batches = (writer_workers * 2).clamp(4, 32);
+    let flow_stale_progress_micros = 100_000;
+    let flow_wait_poll_micros = 75;
     DirectWriterRuntimeConfig {
         periodic_flush_batch_interval,
+        flow_target_backlog_seconds,
+        flow_min_inflight_bytes,
+        flow_max_inflight_bytes,
+        flow_max_queue_backlog_batches,
+        flow_stale_progress_micros,
+        flow_wait_poll_micros,
     }
 }
 
