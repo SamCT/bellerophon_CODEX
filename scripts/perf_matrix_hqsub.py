@@ -59,11 +59,11 @@ def build_inner_command(args, runner, strategy, quality, thread_count, run_dir, 
             str(thread_count),
             '--log-level',
             'info',
-            '--pipeline',
-            RUNNER_PIPELINE[runner],
             '--tmp-dir',
             run_dir,
         ]
+        if runner != 'rust_direct':
+            matrix_cmd.extend(['--pipeline', RUNNER_PIPELINE[runner]])
 
     return (
         'mkdir -p {run_dir} && '
