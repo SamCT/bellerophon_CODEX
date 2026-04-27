@@ -1,5 +1,7 @@
 # bellerophon
 
+This branch was developed using OpenAI's Codex, non-integrated into the HPC. End use is for teaching and research purposes.
+
 Rust-first implementation of the Bellerophon pipeline: filter mapped reads where the mapping spans a junction, retaining the 5-prime read.
 
 This repository now ships the optimized direct Rust pipeline as the primary and only supported implementation.
