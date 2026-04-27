@@ -30,3 +30,7 @@ cargo run --release --manifest-path rust/bellerophon-rs/Cargo.toml -- --help
 Release binary path:
 
 - `target/release/bellerophon-rs`
+
+Python3 optimization speedup, versus a series of rust speedups of the current commit. 5GB BAM R1/R2 file combining at MAPQ=0, across multiple thread intervals.
+
+<img width="1448" height="1086" alt="runtime_RUST1" src="https://github.com/user-attachments/assets/c647121d-1be7-4430-a165-1d6d7a83cb83" />
