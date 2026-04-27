@@ -1,26 +1,20 @@
 [project]
 name = "bellerophon"
 version = "0.1.0"
-description = "Filter mapped reads where the mapping spans a junction, retaining the 5-prime read."
+description = "Rust-first Bellerophon pipeline for filtering junction-spanning mapped reads."
 channels = ["conda-forge"]
 platforms = ["linux-64", "osx-64", "osx-arm64"]
 
 [dependencies]
-python = ">=3.10"
-pip = ">=24"
 rust = ">=1.89.0,<2"
 c-compiler = ">=1.11.0,<2"
 cxx-compiler = ">=1.11.0,<2"
 pkg-config = ">=0.29.2,<0.30"
 make = ">=4.4.1,<5"
 libclang = ">=22.1.4,<23"
-pytest = ">=9.0.3,<10"
-
-[pypi-dependencies]
-bellerophon = { path = ".", editable = true }
 
 [tasks]
-bellerophon = "bellerophon --help"
+bellerophon = "cargo run --release --manifest-path rust/bellerophon-rs/Cargo.toml -- --help"
 cargo-build-rs = "cargo build --release --manifest-path rust/bellerophon-rs/Cargo.toml"
 cargo-test-rs = "cargo test --manifest-path rust/bellerophon-rs/Cargo.toml"
 cargo-help-rs = "cargo run --release --manifest-path rust/bellerophon-rs/Cargo.toml -- --help"
