@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Condvar, Mutex,
@@ -205,6 +205,14 @@ struct DirectWorkerStats {
     writer_periodic_flush_seconds: f64,
     writer_pre_close_flush_seconds: f64,
     output_finalize_non_tail_seconds: f64,
+    total_output_drain_seconds: f64,
+    writer_probe_reason: String,
+    writer_probe_started_with_output_debt_bytes: u64,
+    writer_probe_started_with_output_debt_seconds: f64,
+    writer_probe_started_with_pending_batches: u64,
+    writer_probe_started_with_writer_progress_age_seconds: f64,
+    writer_probe_elapsed_seconds: f64,
+    writer_probe_changed_output_bytes: u64,
     output_bytes_before_close: u64,
     output_bytes_after_close: u64,
     records_written_before_close: u64,
@@ -252,10 +260,15 @@ impl OutputDrainController {
         estimated_uncompressed_bytes: u64,
         writer_bps: u64,
         pending_batches: usize,
+        output_debt_bytes: u64,
+        output_debt_seconds: f64,
+        writer_progress_age_seconds: f64,
         runtime_config: &DirectWriterRuntimeConfig,
-    ) -> bool {
+    ) -> Option<&'static str> {
+        const PROBE_SUPPRESS_RECENT_PROGRESS_SECONDS: f64 = 0.750;
+        const PROBE_LOW_DEBT_SECONDS: f64 = 0.250;
         if estimated_uncompressed_bytes < self.next_probe_estimated_uncompressed_bytes {
-            return false;
+            return None;
         }
         let elapsed_micros = self
             .last_probe_instant
@@ -263,11 +276,11 @@ impl OutputDrainController {
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         if elapsed_micros < runtime_config.drain_min_interval_micros {
-            return false;
+            return None;
         }
         let backlog_evidence_batches = (pending_batches as u64).saturating_mul(8);
         if backlog_evidence_batches > runtime_config.flow_max_queue_backlog_batches {
-            return true;
+            return Some("pending_batches_pressure");
         }
         let probe_period_seconds = (self.drain_duration_ema_seconds * 8.0).max(20.0).min(240.0);
         let throughput_scaled_bytes = writer_bps.saturating_mul(probe_period_seconds as u64);
@@ -281,7 +294,21 @@ impl OutputDrainController {
                     .drain_min_base_bytes
                     .saturating_mul(backlog_evidence_batches + 1),
             );
-        bytes_since_last_probe >= dynamic_probe_floor
+        if output_debt_bytes <= runtime_config.drain_min_base_bytes.saturating_mul(2)
+            && output_debt_seconds <= PROBE_LOW_DEBT_SECONDS
+            && writer_progress_age_seconds <= PROBE_SUPPRESS_RECENT_PROGRESS_SECONDS
+        {
+            return None;
+        }
+        if writer_progress_age_seconds >= runtime_config.flow_target_backlog_seconds.max(0.5)
+            && output_debt_seconds >= PROBE_LOW_DEBT_SECONDS
+        {
+            return Some("stale_writer_progress");
+        }
+        if bytes_since_last_probe >= dynamic_probe_floor {
+            return Some("byte_progress_checkpoint");
+        }
+        None
     }
 
     fn on_probe(
@@ -614,6 +641,8 @@ struct ReaderDecodeStats {
     chunk_interval_samples: u64,
     chunk_interval_min_seconds: f64,
     chunk_interval_max_seconds: f64,
+    chunk_interval_sample_cursor: usize,
+    chunk_interval_sample_window: Vec<f64>,
 }
 
 #[derive(Debug)]
@@ -1123,6 +1152,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     }
     drop(output_batch_sender);
     let writer_output_queue_received = Arc::clone(&output_queue_received);
+    let writer_output_bytes_submitted = Arc::clone(&output_bytes_submitted);
     let writer_output_bytes_written = Arc::clone(&output_bytes_written);
     let writer_bytes_per_second_estimate = Arc::clone(&writer_bytes_per_second_estimate);
     let writer_last_progress_micros = Arc::clone(&writer_last_progress_micros);
@@ -1137,6 +1167,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             output,
             output_path_for_writer,
             writer_output_queue_received,
+            writer_output_bytes_submitted,
             writer_output_bytes_written,
             writer_bytes_per_second_estimate,
             writer_last_progress_micros,
@@ -1579,6 +1610,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
     } else {
         0.0
     };
+    let forward_chunk_interval_p95_seconds =
+        sample_percentile(&forward_reader_stats.chunk_interval_sample_window, 95.0);
+    let reverse_chunk_interval_p95_seconds =
+        sample_percentile(&reverse_reader_stats.chunk_interval_sample_window, 95.0);
+    let max_rss_kb = read_max_rss_kb();
 
     stage_log(
         cli,
@@ -1607,7 +1643,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_reader_diagnostics forward_reader_wall_seconds={:.6} reverse_reader_wall_seconds={:.6} reader_decode_wall_seconds={:.6} reader_decode_thread_seconds={:.6} forward_reader_decode_only_seconds={:.6} reverse_reader_decode_only_seconds={:.6} forward_reader_group_build_seconds={:.6} reverse_reader_group_build_seconds={:.6} forward_reader_htslib_read_seconds={:.6} reverse_reader_htslib_read_seconds={:.6} forward_records_decoded={} reverse_records_decoded={} forward_decode_records_per_second={:.3} reverse_decode_records_per_second={:.3} forward_chunk_interval_samples={} reverse_chunk_interval_samples={} forward_chunk_interval_mean_seconds={:.6} reverse_chunk_interval_mean_seconds={:.6} forward_chunk_interval_min_seconds={:.6} reverse_chunk_interval_min_seconds={:.6} forward_chunk_interval_max_seconds={:.6} reverse_chunk_interval_max_seconds={:.6} reader_threads_spawned={} reader_threads_active_high_watermark={}",
+            "STAGE direct_reader_diagnostics forward_reader_wall_seconds={:.6} reverse_reader_wall_seconds={:.6} reader_decode_wall_seconds={:.6} reader_decode_thread_seconds={:.6} forward_reader_decode_only_seconds={:.6} reverse_reader_decode_only_seconds={:.6} forward_reader_group_build_seconds={:.6} reverse_reader_group_build_seconds={:.6} forward_reader_htslib_read_seconds={:.6} reverse_reader_htslib_read_seconds={:.6} forward_records_decoded={} reverse_records_decoded={} forward_decode_records_per_second={:.3} reverse_decode_records_per_second={:.3} forward_chunk_interval_samples={} reverse_chunk_interval_samples={} forward_chunk_interval_mean_seconds={:.6} reverse_chunk_interval_mean_seconds={:.6} forward_chunk_interval_min_seconds={:.6} reverse_chunk_interval_min_seconds={:.6} forward_chunk_interval_p95_seconds={:.6} reverse_chunk_interval_p95_seconds={:.6} forward_chunk_interval_max_seconds={:.6} reverse_chunk_interval_max_seconds={:.6} reader_threads_spawned={} reader_threads_active_high_watermark={} max_rss_kb={}",
             forward_reader_stats.wall_seconds,
             reverse_reader_stats.wall_seconds,
             reader_decode_wall_seconds,
@@ -1628,10 +1664,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
             reverse_chunk_interval_mean_seconds,
             forward_reader_stats.chunk_interval_min_seconds,
             reverse_reader_stats.chunk_interval_min_seconds,
+            forward_chunk_interval_p95_seconds,
+            reverse_chunk_interval_p95_seconds,
             forward_reader_stats.chunk_interval_max_seconds,
             reverse_reader_stats.chunk_interval_max_seconds,
             reader_threads_spawned,
-            reader_threads_active_high_watermark
+            reader_threads_active_high_watermark,
+            max_rss_kb
         ),
     );
     stage_log(
@@ -1699,7 +1738,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} input_to_compute_queue_max_depth={} input_to_compute_queue_capacity={} compute_to_writer_queue_max_depth={} compute_to_writer_queue_capacity={} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} sync_forward_recv_calls={} sync_reverse_recv_calls={} sync_forward_try_recv_hits={} sync_reverse_try_recv_hits={} sync_forward_blocking_recv_when_reverse_work_available={} sync_reverse_blocking_recv_when_forward_work_available={} sync_slow_side_detected={} sync_slow_side_switch_count={} sync_max_consecutive_waits_forward={} sync_max_consecutive_waits_reverse={} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} input_batches_submitted={} output_batches_submitted={} batches_created={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} input_to_compute_queue_full_events={} compute_to_writer_queue_full_events={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
+            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} input_to_compute_queue_max_depth={} input_to_compute_queue_capacity={} compute_to_writer_queue_max_depth={} compute_to_writer_queue_capacity={} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} sync_forward_recv_calls={} sync_reverse_recv_calls={} sync_forward_try_recv_hits={} sync_reverse_try_recv_hits={} sync_forward_blocking_recv_when_reverse_work_available={} sync_reverse_blocking_recv_when_forward_work_available={} sync_slow_side_detected={} sync_slow_side_switch_count={} sync_max_consecutive_waits_forward={} sync_max_consecutive_waits_reverse={} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} input_batches_submitted={} output_batches_submitted={} batches_created={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} input_to_compute_queue_full_events={} compute_to_writer_queue_full_events={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} forward_chunk_interval_p95_seconds={:.6} reverse_chunk_interval_p95_seconds={:.6} max_rss_kb={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
             writer_recv_wait_seconds,
             max_input_queue_depth,
             queue_policy.output_queue_capacity,
@@ -1762,6 +1801,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
             queue_policy.reader_queue_capacity,
             queue_policy.reader_chunk_groups,
             queue_policy.batch_size
+            ,
+            forward_chunk_interval_p95_seconds,
+            reverse_chunk_interval_p95_seconds,
+            max_rss_kb
         ),
     );
     stage_log(
@@ -1840,7 +1883,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
         - writer_tail_order_wait_seconds
         - writer_tail_write_call_seconds)
         .max(0.0);
-    let writer_tail_unclassified_seconds = (writer_drain_seconds
+    let _writer_tail_unclassified_seconds = (writer_drain_seconds
         - writer_tail_channel_recv_seconds
         - writer_tail_order_wait_seconds
         - writer_tail_write_call_seconds
@@ -2007,6 +2050,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
         cli,
         format!(
             "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} output_finalize_non_tail_seconds={:.6} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} estimated_uncompressed_bytes_written={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
+            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} total_output_drain_seconds={:.6} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} estimated_uncompressed_bytes_written={} writer_probe_reason={} writer_probe_started_with_output_debt_bytes={} writer_probe_started_with_output_debt_seconds={:.6} writer_probe_started_with_pending_batches={} writer_probe_started_with_writer_progress_age_seconds={:.6} writer_probe_elapsed_seconds={:.6} writer_probe_changed_output_bytes={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
             write_call_seconds,
             writer_stats.hts_close_seconds,
             close_to_write_ratio,
@@ -2023,6 +2067,17 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 .output_bytes_after_close
                 .saturating_sub(writer_stats.output_bytes_before_close),
             writer_stats.estimated_uncompressed_bytes_written,
+            if writer_stats.writer_probe_reason.is_empty() {
+                "none".to_string()
+            } else {
+                writer_stats.writer_probe_reason.clone()
+            },
+            writer_stats.writer_probe_started_with_output_debt_bytes,
+            writer_stats.writer_probe_started_with_output_debt_seconds,
+            writer_stats.writer_probe_started_with_pending_batches,
+            writer_stats.writer_probe_started_with_writer_progress_age_seconds,
+            writer_stats.writer_probe_elapsed_seconds,
+            writer_stats.writer_probe_changed_output_bytes,
             shared_pool_drop_seconds,
             output_pool_drop_seconds
         ),
@@ -2400,6 +2455,12 @@ fn read_group_chunks_producer(
             let interval_seconds = previous_send_end.elapsed().as_secs_f64();
             stats.chunk_interval_seconds_total += interval_seconds;
             stats.chunk_interval_samples += 1;
+            push_bounded_sample(
+                &mut stats.chunk_interval_sample_window,
+                &mut stats.chunk_interval_sample_cursor,
+                interval_seconds,
+                READER_CHUNK_INTERVAL_SAMPLE_WINDOW,
+            );
             if stats.chunk_interval_samples == 1 {
                 stats.chunk_interval_min_seconds = interval_seconds;
                 stats.chunk_interval_max_seconds = interval_seconds;
@@ -2439,6 +2500,44 @@ fn read_group_chunks_producer(
     Ok(stats)
 }
 
+fn drain_reader_try_recv(
+    rx: &Receiver<Result<Option<ReaderChunk>>>,
+    queue: &mut VecDeque<DirectRecordGroup>,
+    done: &mut bool,
+    chunk_depth: &Arc<AtomicUsize>,
+    prefetch_groups: usize,
+    try_recv_hits: &mut u64,
+    label: &'static str,
+) -> Result<()> {
+    loop {
+        if *done || queue.len() >= prefetch_groups {
+            break;
+        }
+        match rx.try_recv() {
+            Ok(next_chunk) => {
+                *try_recv_hits += 1;
+                chunk_depth.fetch_sub(1, Ordering::Relaxed);
+                match next_chunk? {
+                    Some(chunk) => {
+                        for group in chunk.groups {
+                            queue.push_back(group);
+                        }
+                    }
+                    None => {
+                        *done = true;
+                        break;
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                bail!("failed to receive {label} chunk: channel disconnected")
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sync_parallel_reader_groups(
     forward_rx: &Receiver<Result<Option<ReaderChunk>>>,
@@ -2469,6 +2568,7 @@ fn sync_parallel_reader_groups(
     const SYNC_SLOW_SIDE_MIN_WAITS: u64 = 8;
     const SYNC_SLOW_SIDE_WAIT_RATIO: f64 = 1.6;
     const SYNC_SLOW_SIDE_WAIT_SECONDS_DELTA: f64 = 0.050;
+    const SYNC_BLOCKING_RECV_TIMEOUT: Duration = Duration::from_millis(2);
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SlowSide {
         Forward,
@@ -2530,66 +2630,24 @@ fn sync_parallel_reader_groups(
         }
         .min(reader_chunk_queue_capacity.max(1));
         let adaptive_prefetch_groups = adaptive_prefetch_chunks * direct_batch_size;
-        let mut drain_forward_try_recv = |sync_diagnostics: &mut SyncDiagnostics| -> Result<()> {
-            loop {
-                if forward_done || forward_queue.len() >= adaptive_prefetch_groups {
-                    break;
-                }
-                match forward_rx.try_recv() {
-                    Ok(next_forward_chunk) => {
-                        sync_diagnostics.forward_try_recv_hits += 1;
-                        forward_chunk_depth.fetch_sub(1, Ordering::Relaxed);
-                        match next_forward_chunk? {
-                            Some(chunk) => {
-                                for group in chunk.groups {
-                                    forward_queue.push_back(group);
-                                }
-                            }
-                            None => {
-                                forward_done = true;
-                                break;
-                            }
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        bail!("failed to receive forward chunk: channel disconnected")
-                    }
-                }
-            }
-            Ok(())
-        };
-        let mut drain_reverse_try_recv = |sync_diagnostics: &mut SyncDiagnostics| -> Result<()> {
-            loop {
-                if reverse_done || reverse_queue.len() >= adaptive_prefetch_groups {
-                    break;
-                }
-                match reverse_rx.try_recv() {
-                    Ok(next_reverse_chunk) => {
-                        sync_diagnostics.reverse_try_recv_hits += 1;
-                        reverse_chunk_depth.fetch_sub(1, Ordering::Relaxed);
-                        match next_reverse_chunk? {
-                            Some(chunk) => {
-                                for group in chunk.groups {
-                                    reverse_queue.push_back(group);
-                                }
-                            }
-                            None => {
-                                reverse_done = true;
-                                break;
-                            }
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        bail!("failed to receive reverse chunk: channel disconnected")
-                    }
-                }
-            }
-            Ok(())
-        };
-        drain_forward_try_recv(sync_diagnostics)?;
-        drain_reverse_try_recv(sync_diagnostics)?;
+        drain_reader_try_recv(
+            forward_rx,
+            &mut forward_queue,
+            &mut forward_done,
+            forward_chunk_depth,
+            adaptive_prefetch_groups,
+            &mut sync_diagnostics.forward_try_recv_hits,
+            "forward",
+        )?;
+        drain_reader_try_recv(
+            reverse_rx,
+            &mut reverse_queue,
+            &mut reverse_done,
+            reverse_chunk_depth,
+            adaptive_prefetch_groups,
+            &mut sync_diagnostics.reverse_try_recv_hits,
+            "reverse",
+        )?;
 
         let can_make_progress_with_reverse_only =
             !pending_forward.is_empty() && reverse_queue.is_empty();
@@ -2597,53 +2655,89 @@ fn sync_parallel_reader_groups(
             !pending_reverse.is_empty() && forward_queue.is_empty();
 
         if !forward_done && forward_queue.is_empty() && !can_make_progress_with_reverse_only {
-            if !reverse_queue.is_empty() || !pending_reverse.is_empty() {
+            let reverse_work_available = !reverse_queue.is_empty() || !pending_reverse.is_empty();
+            if reverse_work_available {
                 sync_diagnostics.forward_blocking_recv_when_reverse_work_available += 1;
             }
             let wait_start = Instant::now();
             sync_diagnostics.forward_recv_calls += 1;
-            let next_forward_chunk = forward_rx
-                .recv()
-                .context("failed to receive forward chunk")??;
-            sync_diagnostics.wait_for_forward_chunk_seconds += wait_start.elapsed().as_secs_f64();
+            let next_forward_chunk = if reverse_work_available {
+                match forward_rx.recv_timeout(SYNC_BLOCKING_RECV_TIMEOUT) {
+                    Ok(chunk) => Some(chunk),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        bail!("failed to receive forward chunk: channel disconnected")
+                    }
+                }
+            } else {
+                Some(
+                    forward_rx
+                        .recv()
+                        .context("failed to receive forward chunk")?,
+                )
+            };
+            let waited = wait_start.elapsed().as_secs_f64();
+            sync_diagnostics.wait_for_forward_chunk_seconds += waited;
             consecutive_waits_forward += 1;
             consecutive_waits_reverse = 0;
             sync_diagnostics.max_consecutive_waits_forward = sync_diagnostics
                 .max_consecutive_waits_forward
                 .max(consecutive_waits_forward);
-            forward_chunk_depth.fetch_sub(1, Ordering::Relaxed);
-            match next_forward_chunk {
-                Some(chunk) => {
-                    for group in chunk.groups {
-                        forward_queue.push_back(group);
+            if let Some(next_forward_chunk) = next_forward_chunk {
+                forward_chunk_depth.fetch_sub(1, Ordering::Relaxed);
+                match next_forward_chunk? {
+                    Some(chunk) => {
+                        for group in chunk.groups {
+                            forward_queue.push_back(group);
+                        }
                     }
+                    None => forward_done = true,
                 }
-                None => forward_done = true,
+            } else {
+                drain_reverse_try_recv(sync_diagnostics)?;
             }
         }
         if !reverse_done && reverse_queue.is_empty() && !can_make_progress_with_forward_only {
-            if !forward_queue.is_empty() || !pending_forward.is_empty() {
+            let forward_work_available = !forward_queue.is_empty() || !pending_forward.is_empty();
+            if forward_work_available {
                 sync_diagnostics.reverse_blocking_recv_when_forward_work_available += 1;
             }
             let wait_start = Instant::now();
             sync_diagnostics.reverse_recv_calls += 1;
-            let next_reverse_chunk = reverse_rx
-                .recv()
-                .context("failed to receive reverse chunk")??;
-            sync_diagnostics.wait_for_reverse_chunk_seconds += wait_start.elapsed().as_secs_f64();
+            let next_reverse_chunk = if forward_work_available {
+                match reverse_rx.recv_timeout(SYNC_BLOCKING_RECV_TIMEOUT) {
+                    Ok(chunk) => Some(chunk),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        bail!("failed to receive reverse chunk: channel disconnected")
+                    }
+                }
+            } else {
+                Some(
+                    reverse_rx
+                        .recv()
+                        .context("failed to receive reverse chunk")?,
+                )
+            };
+            let waited = wait_start.elapsed().as_secs_f64();
+            sync_diagnostics.wait_for_reverse_chunk_seconds += waited;
             consecutive_waits_reverse += 1;
             consecutive_waits_forward = 0;
             sync_diagnostics.max_consecutive_waits_reverse = sync_diagnostics
                 .max_consecutive_waits_reverse
                 .max(consecutive_waits_reverse);
-            reverse_chunk_depth.fetch_sub(1, Ordering::Relaxed);
-            match next_reverse_chunk {
-                Some(chunk) => {
-                    for group in chunk.groups {
-                        reverse_queue.push_back(group);
+            if let Some(next_reverse_chunk) = next_reverse_chunk {
+                reverse_chunk_depth.fetch_sub(1, Ordering::Relaxed);
+                match next_reverse_chunk? {
+                    Some(chunk) => {
+                        for group in chunk.groups {
+                            reverse_queue.push_back(group);
+                        }
                     }
+                    None => reverse_done = true,
                 }
-                None => reverse_done = true,
+            } else {
+                drain_forward_try_recv(sync_diagnostics)?;
             }
         }
 
@@ -3103,6 +3197,7 @@ impl OutputFlowController {
         moderate_pressure && inner.compute_active >= adaptive_compute
     }
     fn should_wait_output_submit(inner: &OutputFlowInner, max_compute_workers: usize) -> bool {
+        const OUTPUT_SUBMIT_RECENT_PROGRESS_SECONDS: f64 = 0.24;
         let debt_bytes = Self::debt_bytes(inner);
         let debt_batches = Self::debt_batches(inner);
         let completed_gap = inner
@@ -3110,6 +3205,15 @@ impl OutputFlowController {
             .saturating_sub(inner.next_expected_batch_id);
         let (debt_byte_limit, debt_batch_limit, ordered_limit, _) =
             Self::dynamic_limits(inner, max_compute_workers);
+        let writer_progress_age = inner.writer_last_progress_time.elapsed().as_secs_f64();
+        let writer_recent_progress = writer_progress_age <= inner.flow_target_backlog_seconds;
+        let severe_pressure = debt_bytes > debt_byte_limit.saturating_mul(2)
+            || debt_batches > debt_batch_limit.saturating_mul(2)
+            || inner.ordered_pending_bytes_estimate > debt_byte_limit.saturating_mul(2)
+            || completed_gap > ordered_limit.saturating_mul(2);
+        if writer_recent_progress && !severe_pressure {
+            return false;
+        }
         if debt_bytes > debt_byte_limit || debt_batches > debt_batch_limit {
             return true;
         }
@@ -3384,6 +3488,7 @@ fn direct_writer_thread(
     mut output: Writer,
     output_path: PathBuf,
     output_queue_received: Arc<AtomicU64>,
+    output_bytes_submitted: Arc<AtomicU64>,
     output_bytes_written: Arc<AtomicU64>,
     writer_bytes_per_second_estimate: Arc<AtomicU64>,
     writer_last_progress_micros: Arc<AtomicU64>,
@@ -3503,24 +3608,55 @@ fn direct_writer_thread(
                 writer_bytes_per_second_estimate.store(next_bps, Ordering::Relaxed);
             }
             let writer_bps = writer_bytes_per_second_estimate.load(Ordering::Relaxed);
-            if drain_controller.should_probe(
+            let submitted_output_bytes = output_bytes_submitted.load(Ordering::Relaxed);
+            let written_output_bytes = output_bytes_written.load(Ordering::Relaxed);
+            let output_debt_bytes = submitted_output_bytes.saturating_sub(written_output_bytes);
+            let output_debt_seconds =
+                output_debt_bytes as f64 / writer_bps.max(4 * 1024 * 1024) as f64;
+            let last_progress_micros = writer_last_progress_micros.load(Ordering::Relaxed);
+            let writer_progress_age_seconds = if last_progress_micros == 0 {
+                pipeline_start.elapsed().as_secs_f64()
+            } else {
+                (pipeline_start.elapsed().as_micros() as u64).saturating_sub(last_progress_micros)
+                    as f64
+                    / 1e6f64
+            };
+            if let Some(probe_reason) = drain_controller.should_probe(
                 worker_stats.estimated_uncompressed_bytes_written,
                 writer_bps,
                 pending.len(),
+                output_debt_bytes,
+                output_debt_seconds,
+                writer_progress_age_seconds,
                 &runtime_config,
             ) {
                 let checkpoint_start = Instant::now();
                 // rust-htslib::bam::Writer does not expose a flush API in rust-htslib 0.51.0.
                 // Keep periodic diagnostics by sampling observable on-disk progress instead.
-                let _periodic_output_bytes = fs::metadata(&output_path)
+                let periodic_output_bytes_before = fs::metadata(&output_path)
                     .map(|meta| meta.len())
                     .unwrap_or(0);
+                let periodic_output_bytes_after = fs::metadata(&output_path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(periodic_output_bytes_before);
                 let checkpoint_micros = checkpoint_start
                     .elapsed()
                     .as_micros()
                     .min(u128::from(u64::MAX)) as u64;
                 worker_stats.writer_periodic_flush_seconds += checkpoint_micros as f64 / 1e6f64;
                 worker_stats.writer_periodic_flush_count += 1;
+                worker_stats.writer_probe_reason = probe_reason.to_string();
+                worker_stats.writer_probe_started_with_output_debt_bytes = output_debt_bytes;
+                worker_stats.writer_probe_started_with_output_debt_seconds = output_debt_seconds;
+                worker_stats.writer_probe_started_with_pending_batches = pending.len() as u64;
+                worker_stats.writer_probe_started_with_writer_progress_age_seconds =
+                    writer_progress_age_seconds;
+                worker_stats.writer_probe_elapsed_seconds += checkpoint_micros as f64 / 1e6f64;
+                worker_stats.writer_probe_changed_output_bytes = worker_stats
+                    .writer_probe_changed_output_bytes
+                    .saturating_add(
+                        periodic_output_bytes_after.saturating_sub(periodic_output_bytes_before),
+                    );
                 drain_controller.on_probe(
                     worker_stats.estimated_uncompressed_bytes_written,
                     checkpoint_micros,
@@ -3596,6 +3732,43 @@ fn classify_primary_bottleneck(parts: &[(&'static str, f64)]) -> &'static str {
         return "mixed";
     }
     sorted[0].0
+const READER_CHUNK_INTERVAL_SAMPLE_WINDOW: usize = 4096;
+
+fn push_bounded_sample(samples: &mut Vec<f64>, cursor: &mut usize, value: f64, max_len: usize) {
+    if max_len == 0 {
+        return;
+    }
+    if samples.len() < max_len {
+        samples.push(value);
+        return;
+    }
+    let index = *cursor % max_len;
+    samples[index] = value;
+    *cursor = (*cursor + 1) % max_len;
+}
+
+fn sample_percentile(samples: &[f64], percentile: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut copy = samples.to_vec();
+    percentile_seconds(&mut copy, percentile)
+}
+
+fn read_max_rss_kb() -> u64 {
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("VmHWM:") {
+            return value
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    0
 }
 
 fn format_u64_slice(values: &[u64]) -> String {
