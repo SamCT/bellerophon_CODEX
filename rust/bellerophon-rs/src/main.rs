@@ -213,6 +213,14 @@ struct DirectWorkerStats {
     writer_probe_started_with_writer_progress_age_seconds: f64,
     writer_probe_elapsed_seconds: f64,
     writer_probe_changed_output_bytes: u64,
+    writer_probe_executed_count: u64,
+    writer_probe_skipped_count: u64,
+    writer_probe_skip_reason: String,
+    writer_probe_last_skip_reason: String,
+    writer_probe_skipped_output_debt_seconds: f64,
+    writer_probe_skipped_pending_batches: u64,
+    writer_probe_skipped_writer_progress_age_seconds: f64,
+    writer_probe_skipped_estimated_bytes: u64,
     output_bytes_before_close: u64,
     output_bytes_after_close: u64,
     records_written_before_close: u64,
@@ -353,6 +361,33 @@ impl OutputDrainController {
         self.last_probe_estimated_uncompressed_bytes = estimated_uncompressed_bytes;
         self.last_probe_instant = Instant::now();
     }
+
+    fn on_probe_skipped(&mut self) {
+        self.last_probe_instant = Instant::now();
+    }
+}
+
+fn should_skip_pending_batches_probe(
+    output_debt_seconds: f64,
+    pending_batches: usize,
+    writer_progress_age_seconds: f64,
+    worker_stats: &DirectWorkerStats,
+) -> Option<&'static str> {
+    const MAX_NEGLIGIBLE_OUTPUT_DEBT_SECONDS: f64 = 0.020;
+    const MAX_SMALL_PENDING_BATCHES: usize = 8;
+    const MAX_RECENT_WRITER_PROGRESS_SECONDS: f64 = 0.050;
+    if output_debt_seconds > MAX_NEGLIGIBLE_OUTPUT_DEBT_SECONDS
+        || pending_batches > MAX_SMALL_PENDING_BATCHES
+        || writer_progress_age_seconds > MAX_RECENT_WRITER_PROGRESS_SECONDS
+    {
+        return None;
+    }
+    if worker_stats.writer_probe_executed_count > 0
+        && worker_stats.writer_probe_changed_output_bytes == 0
+    {
+        return Some("previous_probe_noop");
+    }
+    Some("below_min_probe_value")
 }
 
 #[derive(Default, Clone, Debug)]
@@ -2049,7 +2084,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} total_output_drain_seconds={:.6} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} estimated_uncompressed_bytes_written={} writer_probe_reason={} writer_probe_started_with_output_debt_bytes={} writer_probe_started_with_output_debt_seconds={:.6} writer_probe_started_with_pending_batches={} writer_probe_started_with_writer_progress_age_seconds={:.6} writer_probe_elapsed_seconds={:.6} writer_probe_changed_output_bytes={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
+            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} total_output_drain_seconds={:.6} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} estimated_uncompressed_bytes_written={} writer_probe_reason={} writer_probe_started_with_output_debt_bytes={} writer_probe_started_with_output_debt_seconds={:.6} writer_probe_started_with_pending_batches={} writer_probe_started_with_writer_progress_age_seconds={:.6} writer_probe_elapsed_seconds={:.6} writer_probe_changed_output_bytes={} writer_probe_executed_count={} writer_probe_skipped_count={} writer_probe_skip_reason={} writer_probe_last_skip_reason={} writer_probe_skipped_output_debt_seconds={:.6} writer_probe_skipped_pending_batches={} writer_probe_skipped_writer_progress_age_seconds={:.6} writer_probe_skipped_estimated_bytes={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
             write_call_seconds,
             writer_stats.hts_close_seconds,
             close_to_write_ratio,
@@ -2077,6 +2112,22 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_stats.writer_probe_started_with_writer_progress_age_seconds,
             writer_stats.writer_probe_elapsed_seconds,
             writer_stats.writer_probe_changed_output_bytes,
+            writer_stats.writer_probe_executed_count,
+            writer_stats.writer_probe_skipped_count,
+            if writer_stats.writer_probe_skip_reason.is_empty() {
+                "none".to_string()
+            } else {
+                writer_stats.writer_probe_skip_reason.clone()
+            },
+            if writer_stats.writer_probe_last_skip_reason.is_empty() {
+                "none".to_string()
+            } else {
+                writer_stats.writer_probe_last_skip_reason.clone()
+            },
+            writer_stats.writer_probe_skipped_output_debt_seconds,
+            writer_stats.writer_probe_skipped_pending_batches,
+            writer_stats.writer_probe_skipped_writer_progress_age_seconds,
+            writer_stats.writer_probe_skipped_estimated_bytes,
             shared_pool_drop_seconds,
             output_pool_drop_seconds
         ),
@@ -3645,6 +3696,31 @@ fn direct_writer_thread(
                 writer_progress_age_seconds,
                 &runtime_config,
             ) {
+                if probe_reason == "pending_batches_pressure" {
+                    if let Some(skip_reason) = should_skip_pending_batches_probe(
+                        output_debt_seconds,
+                        pending.len(),
+                        writer_progress_age_seconds,
+                        &worker_stats,
+                    ) {
+                        worker_stats.writer_probe_skipped_count += 1;
+                        if worker_stats.writer_probe_skip_reason.is_empty() {
+                            worker_stats.writer_probe_skip_reason = skip_reason.to_string();
+                        }
+                        worker_stats.writer_probe_last_skip_reason = skip_reason.to_string();
+                        worker_stats.writer_probe_skipped_output_debt_seconds = output_debt_seconds;
+                        worker_stats.writer_probe_skipped_pending_batches = pending.len() as u64;
+                        worker_stats.writer_probe_skipped_writer_progress_age_seconds =
+                            writer_progress_age_seconds;
+                        worker_stats.writer_probe_skipped_estimated_bytes =
+                            worker_stats.estimated_uncompressed_bytes_written;
+                        drain_controller.on_probe_skipped();
+                        next_batch_id += 1;
+                        ordered_writer_next_expected_batch_id
+                            .store(next_batch_id, Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 let checkpoint_start = Instant::now();
                 // rust-htslib::bam::Writer does not expose a flush API in rust-htslib 0.51.0.
                 // Keep periodic diagnostics by sampling observable on-disk progress instead.
@@ -3660,6 +3736,7 @@ fn direct_writer_thread(
                     .min(u128::from(u64::MAX)) as u64;
                 worker_stats.writer_periodic_flush_seconds += checkpoint_micros as f64 / 1e6f64;
                 worker_stats.writer_periodic_flush_count += 1;
+                worker_stats.writer_probe_executed_count += 1;
                 worker_stats.writer_probe_reason = probe_reason.to_string();
                 worker_stats.writer_probe_started_with_output_debt_bytes = output_debt_bytes;
                 worker_stats.writer_probe_started_with_output_debt_seconds = output_debt_seconds;
