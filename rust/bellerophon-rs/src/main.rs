@@ -2049,7 +2049,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} output_finalize_non_tail_seconds={:.6} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} estimated_uncompressed_bytes_written={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
             "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} total_output_drain_seconds={:.6} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} estimated_uncompressed_bytes_written={} writer_probe_reason={} writer_probe_started_with_output_debt_bytes={} writer_probe_started_with_output_debt_seconds={:.6} writer_probe_started_with_pending_batches={} writer_probe_started_with_writer_progress_age_seconds={:.6} writer_probe_elapsed_seconds={:.6} writer_probe_changed_output_bytes={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
             write_call_seconds,
             writer_stats.hts_close_seconds,
@@ -2694,7 +2693,15 @@ fn sync_parallel_reader_groups(
                     None => forward_done = true,
                 }
             } else {
-                drain_reverse_try_recv(sync_diagnostics)?;
+                drain_reader_try_recv(
+                    reverse_rx,
+                    &mut reverse_queue,
+                    &mut reverse_done,
+                    reverse_chunk_depth,
+                    adaptive_prefetch_groups,
+                    &mut sync_diagnostics.reverse_try_recv_hits,
+                    "reverse",
+                )?;
             }
         }
         if !reverse_done && reverse_queue.is_empty() && !can_make_progress_with_forward_only {
@@ -2737,7 +2744,15 @@ fn sync_parallel_reader_groups(
                     None => reverse_done = true,
                 }
             } else {
-                drain_forward_try_recv(sync_diagnostics)?;
+                drain_reader_try_recv(
+                    forward_rx,
+                    &mut forward_queue,
+                    &mut forward_done,
+                    forward_chunk_depth,
+                    adaptive_prefetch_groups,
+                    &mut sync_diagnostics.forward_try_recv_hits,
+                    "forward",
+                )?;
             }
         }
 
@@ -3206,7 +3221,7 @@ impl OutputFlowController {
         let (debt_byte_limit, debt_batch_limit, ordered_limit, _) =
             Self::dynamic_limits(inner, max_compute_workers);
         let writer_progress_age = inner.writer_last_progress_time.elapsed().as_secs_f64();
-        let writer_recent_progress = writer_progress_age <= inner.flow_target_backlog_seconds;
+        let writer_recent_progress = writer_progress_age <= OUTPUT_SUBMIT_RECENT_PROGRESS_SECONDS;
         let severe_pressure = debt_bytes > debt_byte_limit.saturating_mul(2)
             || debt_batches > debt_batch_limit.saturating_mul(2)
             || inner.ordered_pending_bytes_estimate > debt_byte_limit.saturating_mul(2)
