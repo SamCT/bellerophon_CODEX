@@ -25,7 +25,7 @@ def shell_join(values):
     return ' '.join(shlex.quote(v) for v in values)
 
 
-def build_inner_command(args, runner, strategy, quality, thread_count, run_dir, output_bam, time_txt, log_txt):
+def build_inner_command(args, runner, strategy, quality, thread_count, run_dir, output_bam, time_txt, log_txt, run_order):
     if runner == 'python':
         matrix_cmd = [
             'python',
@@ -67,12 +67,26 @@ def build_inner_command(args, runner, strategy, quality, thread_count, run_dir, 
 
     return (
         'mkdir -p {run_dir} && '
+        'printf %s\\n '
+        '"run_order={run_order}" '
+        '"commit_sha=$(git -C {repo_root} rev-parse HEAD 2>/dev/null || true)" '
+        '"hostname=$(hostname 2>/dev/null || true)" '
+        '"slurm_job_id=${{SLURM_JOB_ID:-}}" '
+        '"pbs_jobid=${{PBS_JOBID:-}}" '
+        '"lsb_jobid=${{LSB_JOBID:-}}" '
+        '"runner={runner}" '
+        '"strategy={strategy}" '
+        '> {meta_txt} && '
         'BELLEROPHON_IO_THREADS_STRATEGY={strategy} '
         '/usr/bin/time -v -o {time_txt} {matrix_cmd} '
         '> {log_txt} 2>&1'
     ).format(
         run_dir=shlex.quote(run_dir),
+        run_order=run_order,
+        repo_root=shlex.quote(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        runner=shlex.quote(runner),
         strategy=shlex.quote(strategy),
+        meta_txt=shlex.quote(os.path.join(run_dir, 'run_meta.txt')),
         time_txt=shlex.quote(time_txt),
         matrix_cmd=shell_join(matrix_cmd),
         log_txt=shlex.quote(log_txt),
@@ -131,9 +145,11 @@ def main():
     print('mkdir -p {base_dir}'.format(base_dir=base_dir))
     print('# submit one job per matrix cell')
 
+    run_order = 0
     for runner, quality, thread_count in itertools.product(runners, qualities, threads):
         runner_strategies = strategies if runner == 'python' else [args.rust_strategy]
         for strategy in runner_strategies:
+            run_order += 1
             run_id = 'r{runner}_s{strategy}_q{quality}_t{thread_count}'.format(
                 runner=runner,
                 strategy=strategy,
@@ -154,6 +170,7 @@ def main():
                 output_bam,
                 time_txt,
                 log_txt,
+                run_order,
             )
             project_cpus = thread_count if args.project_cpus_mode == 'thread' else args.project_cpus
             resource = '{prefix}_{run_id}'.format(prefix=args.resource_prefix, run_id=run_id) if args.resource_prefix else args.resource

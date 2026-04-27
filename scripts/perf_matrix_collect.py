@@ -3,6 +3,7 @@ import argparse
 import csv
 import os
 import re
+import subprocess
 
 
 TIME_PATTERNS = {
@@ -43,8 +44,45 @@ def parse_time_metrics(path):
     for key, pattern in TIME_PATTERNS.items():
         match = re.search(pattern, text)
         metrics[key] = match.group(1) if match else ''
+    metrics['filesystem_inputs'] = metrics.get('fs_inputs', '')
+    metrics['filesystem_outputs'] = metrics.get('fs_outputs', '')
     metrics['wall_seconds'] = elapsed_to_seconds(metrics['wall_clock'])
     return metrics
+
+
+def _as_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def detect_commit_sha(matrix_dir):
+    try:
+        output = subprocess.check_output(
+            ['git', '-C', matrix_dir, 'rev-parse', 'HEAD'],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if output:
+            return output
+    except Exception:
+        pass
+    return ''
+
+
+def parse_run_metadata(run_dir):
+    metadata = {}
+    metadata_path = os.path.join(run_dir, 'run_meta.txt')
+    if not os.path.exists(metadata_path):
+        return metadata
+    text = read_text(metadata_path)
+    for line in text.splitlines():
+        if '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        metadata[key.strip()] = value.strip()
+    return metadata
 
 
 def parse_stage_metrics(path):
@@ -129,6 +167,9 @@ def parse_stage_metrics(path):
     row.update(parse_stage_kv('direct_pipeline_diagnostics'))
     row.update(parse_stage_kv('direct_total_summary'))
     row.update(parse_stage_kv('direct_thread_resolution'))
+    row.update(parse_stage_kv('direct_lifecycle_exclusive'))
+    row.update(parse_stage_kv('writer_tail_breakdown_exclusive'))
+    row.update(parse_stage_kv('direct_close_diagnostics'))
 
     legacy_total = parse_stage_kv('direct_summary').get('total_output_drain_seconds')
     if legacy_total and 'writer_tail_seconds' in row:
@@ -146,11 +187,35 @@ def parse_stage_metrics(path):
         'sync_wait_forward_seconds': 'sync_wait_for_forward_chunk_seconds',
         'sync_wait_reverse_seconds': 'sync_wait_for_reverse_chunk_seconds',
         'writer_tail_primary_cause': 'writer_drain_primary_cause',
+        'primary_bottleneck': 'primary_bottleneck',
+        'input_wait_seconds_total': 'input_wait_seconds_cumulative',
+        'compute_start_wait_seconds_total': 'compute_start_wait_seconds_cumulative',
+        'output_submit_wait_seconds_total': 'output_submit_wait_seconds_cumulative',
         'wall_time': 'wall_seconds',
     }
     for out_key, source_key in aliases.items():
         if out_key not in row and source_key in row:
             row[out_key] = row[source_key]
+
+    output_gib = _as_float(row.get('output_gib'))
+    if output_gib <= 0.0:
+        output_mb = _as_float(row.get('output_mb'))
+        if output_mb > 0.0:
+            output_gib = output_mb / 1024.0
+            row['output_gib'] = str(output_gib)
+    groups = _as_float(row.get('pair_groups') or row.get('groups'))
+    groups_million = groups / 1_000_000.0 if groups > 0 else 0.0
+
+    if output_gib > 0.0:
+        row['wall_seconds_per_output_gib'] = str(_as_float(row.get('wall_seconds')) / output_gib)
+        row['writer_tail_seconds_per_output_gib'] = str(
+            _as_float(row.get('writer_tail_seconds')) / output_gib
+        )
+    if groups_million > 0.0:
+        row['wall_seconds_per_million_groups'] = str(_as_float(row.get('wall_seconds')) / groups_million)
+        row['writer_tail_seconds_per_million_groups'] = str(
+            _as_float(row.get('writer_tail_seconds')) / groups_million
+        )
 
     return row
 
@@ -174,10 +239,10 @@ def main():
     args = parser.parse_args()
 
     rows = []
-    for run_id in sorted(os.listdir(args.matrix_dir)):
+    run_ids = [run_id for run_id in sorted(os.listdir(args.matrix_dir)) if os.path.isdir(os.path.join(args.matrix_dir, run_id))]
+    fallback_commit_sha = detect_commit_sha(args.matrix_dir)
+    for run_order, run_id in enumerate(run_ids, start=1):
         run_dir = os.path.join(args.matrix_dir, run_id)
-        if not os.path.isdir(run_dir):
-            continue
 
         # New format: r<runner>_s<strategy>_q<q>_t<t>
         match = re.match(r'r([^_]+(?:_[^_]+)*)_s([^_]+)_q([0-9]+)_t([0-9]+)$', run_id)
@@ -193,6 +258,7 @@ def main():
 
         row = {
             'run_id': run_id,
+            'run_order': run_order,
             'runner': runner,
             'pipeline': infer_pipeline(runner),
             'strategy': strategy,
@@ -201,6 +267,17 @@ def main():
         }
         row.update(parse_time_metrics(os.path.join(run_dir, 'time.txt')))
         row.update(parse_stage_metrics(os.path.join(run_dir, 'run.log')))
+        row.update(parse_run_metadata(run_dir))
+        if not row.get('commit_sha'):
+            row['commit_sha'] = fallback_commit_sha
+        row['cpu_percent'] = row.get('cpu_percent', '')
+        row['max_rss_kb'] = row.get('max_rss_kb', '')
+        row['filesystem_inputs'] = row.get('filesystem_inputs', row.get('fs_inputs', ''))
+        row['filesystem_outputs'] = row.get('filesystem_outputs', row.get('fs_outputs', ''))
+        if not row.get('job_id'):
+            row['job_id'] = row.get('slurm_job_id') or row.get('pbs_jobid') or row.get('lsb_jobid') or ''
+        if not row.get('node_name'):
+            row['node_name'] = row.get('hostname', '')
         rows.append(row)
 
     fieldnames = sorted({k for row in rows for k in row.keys()})
