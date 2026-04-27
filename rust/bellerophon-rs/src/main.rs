@@ -3732,6 +3732,8 @@ fn classify_primary_bottleneck(parts: &[(&'static str, f64)]) -> &'static str {
         return "mixed";
     }
     sorted[0].0
+}
+
 const READER_CHUNK_INTERVAL_SAMPLE_WINDOW: usize = 4096;
 
 fn push_bounded_sample(samples: &mut Vec<f64>, cursor: &mut usize, value: f64, max_len: usize) {
