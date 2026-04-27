@@ -1151,6 +1151,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     }
     drop(output_batch_sender);
     let writer_output_queue_received = Arc::clone(&output_queue_received);
+    let writer_output_bytes_submitted = Arc::clone(&output_bytes_submitted);
     let writer_output_bytes_written = Arc::clone(&output_bytes_written);
     let writer_bytes_per_second_estimate = Arc::clone(&writer_bytes_per_second_estimate);
     let writer_last_progress_micros = Arc::clone(&writer_last_progress_micros);
@@ -1165,6 +1166,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             output,
             output_path_for_writer,
             writer_output_queue_received,
+            writer_output_bytes_submitted,
             writer_output_bytes_written,
             writer_bytes_per_second_estimate,
             writer_last_progress_micros,
@@ -1880,7 +1882,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
         - writer_tail_order_wait_seconds
         - writer_tail_write_call_seconds)
         .max(0.0);
-    let writer_tail_unclassified_seconds = (writer_drain_seconds
+    let _writer_tail_unclassified_seconds = (writer_drain_seconds
         - writer_tail_channel_recv_seconds
         - writer_tail_order_wait_seconds
         - writer_tail_write_call_seconds
@@ -2433,6 +2435,44 @@ fn read_group_chunks_producer(
     Ok(stats)
 }
 
+fn drain_reader_try_recv(
+    rx: &Receiver<Result<Option<ReaderChunk>>>,
+    queue: &mut VecDeque<DirectRecordGroup>,
+    done: &mut bool,
+    chunk_depth: &Arc<AtomicUsize>,
+    prefetch_groups: usize,
+    try_recv_hits: &mut u64,
+    label: &'static str,
+) -> Result<()> {
+    loop {
+        if *done || queue.len() >= prefetch_groups {
+            break;
+        }
+        match rx.try_recv() {
+            Ok(next_chunk) => {
+                *try_recv_hits += 1;
+                chunk_depth.fetch_sub(1, Ordering::Relaxed);
+                match next_chunk? {
+                    Some(chunk) => {
+                        for group in chunk.groups {
+                            queue.push_back(group);
+                        }
+                    }
+                    None => {
+                        *done = true;
+                        break;
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                bail!("failed to receive {label} chunk: channel disconnected")
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sync_parallel_reader_groups(
     forward_rx: &Receiver<Result<Option<ReaderChunk>>>,
@@ -2525,66 +2565,24 @@ fn sync_parallel_reader_groups(
         }
         .min(reader_chunk_queue_capacity.max(1));
         let adaptive_prefetch_groups = adaptive_prefetch_chunks * direct_batch_size;
-        let mut drain_forward_try_recv = |sync_diagnostics: &mut SyncDiagnostics| -> Result<()> {
-            loop {
-                if forward_done || forward_queue.len() >= adaptive_prefetch_groups {
-                    break;
-                }
-                match forward_rx.try_recv() {
-                    Ok(next_forward_chunk) => {
-                        sync_diagnostics.forward_try_recv_hits += 1;
-                        forward_chunk_depth.fetch_sub(1, Ordering::Relaxed);
-                        match next_forward_chunk? {
-                            Some(chunk) => {
-                                for group in chunk.groups {
-                                    forward_queue.push_back(group);
-                                }
-                            }
-                            None => {
-                                forward_done = true;
-                                break;
-                            }
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        bail!("failed to receive forward chunk: channel disconnected")
-                    }
-                }
-            }
-            Ok(())
-        };
-        let mut drain_reverse_try_recv = |sync_diagnostics: &mut SyncDiagnostics| -> Result<()> {
-            loop {
-                if reverse_done || reverse_queue.len() >= adaptive_prefetch_groups {
-                    break;
-                }
-                match reverse_rx.try_recv() {
-                    Ok(next_reverse_chunk) => {
-                        sync_diagnostics.reverse_try_recv_hits += 1;
-                        reverse_chunk_depth.fetch_sub(1, Ordering::Relaxed);
-                        match next_reverse_chunk? {
-                            Some(chunk) => {
-                                for group in chunk.groups {
-                                    reverse_queue.push_back(group);
-                                }
-                            }
-                            None => {
-                                reverse_done = true;
-                                break;
-                            }
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        bail!("failed to receive reverse chunk: channel disconnected")
-                    }
-                }
-            }
-            Ok(())
-        };
-        drain_forward_try_recv(sync_diagnostics)?;
-        drain_reverse_try_recv(sync_diagnostics)?;
+        drain_reader_try_recv(
+            forward_rx,
+            &mut forward_queue,
+            &mut forward_done,
+            forward_chunk_depth,
+            adaptive_prefetch_groups,
+            &mut sync_diagnostics.forward_try_recv_hits,
+            "forward",
+        )?;
+        drain_reader_try_recv(
+            reverse_rx,
+            &mut reverse_queue,
+            &mut reverse_done,
+            reverse_chunk_depth,
+            adaptive_prefetch_groups,
+            &mut sync_diagnostics.reverse_try_recv_hits,
+            "reverse",
+        )?;
 
         let can_make_progress_with_reverse_only =
             !pending_forward.is_empty() && reverse_queue.is_empty();
@@ -3134,6 +3132,7 @@ impl OutputFlowController {
         moderate_pressure && inner.compute_active >= adaptive_compute
     }
     fn should_wait_output_submit(inner: &OutputFlowInner, max_compute_workers: usize) -> bool {
+        const OUTPUT_SUBMIT_RECENT_PROGRESS_SECONDS: f64 = 0.24;
         let debt_bytes = Self::debt_bytes(inner);
         let debt_batches = Self::debt_batches(inner);
         let completed_gap = inner
@@ -3424,6 +3423,7 @@ fn direct_writer_thread(
     mut output: Writer,
     output_path: PathBuf,
     output_queue_received: Arc<AtomicU64>,
+    output_bytes_submitted: Arc<AtomicU64>,
     output_bytes_written: Arc<AtomicU64>,
     writer_bytes_per_second_estimate: Arc<AtomicU64>,
     writer_last_progress_micros: Arc<AtomicU64>,
