@@ -204,7 +204,7 @@ struct DirectWorkerStats {
     writer_periodic_flush_count: u64,
     writer_periodic_flush_seconds: f64,
     writer_pre_close_flush_seconds: f64,
-    total_output_drain_seconds: f64,
+    output_finalize_non_tail_seconds: f64,
     output_bytes_before_close: u64,
     output_bytes_after_close: u64,
     records_written_before_close: u64,
@@ -1823,7 +1823,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
         + output_pool_drop_seconds_total;
     let total_output_pressure_seconds =
         writer_drain_seconds + output_probe_seconds + output_finalize_seconds;
-    let total_output_drain_seconds = output_probe_seconds
+    let output_finalize_non_tail_seconds = output_probe_seconds
         + writer_stats.writer_pre_close_flush_seconds
         + writer_stats.hts_close_seconds
         + shared_pool_drop_seconds
@@ -1848,23 +1848,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
         - writer_tail_pool_drop_seconds
         - writer_tail_join_overhead_seconds)
         .max(0.0);
-    let writer_drain_primary_cause = {
-        let mut parts = vec![
-            ("channel_drain", writer_tail_channel_recv_seconds),
-            ("ordered_backlog", writer_tail_order_wait_seconds),
-            ("write_calls", writer_tail_write_call_seconds),
-            ("bgzf_finalize", writer_tail_bgzf_finalize_seconds),
-            ("pool_drop", writer_tail_pool_drop_seconds),
-        ];
-        parts.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
-        if parts[0].1 <= 0.0 {
-            "unknown"
-        } else if parts.len() > 1 && parts[1].1 > parts[0].1 * 0.75 {
-            "mixed"
-        } else {
-            parts[0].0
-        }
-    };
+    let writer_drain_primary_cause = classify_primary_bottleneck(&[
+        ("channel_drain", writer_tail_channel_recv_seconds),
+        ("ordered_backlog", writer_tail_order_wait_seconds),
+        ("write_calls", writer_tail_write_call_seconds),
+        ("bgzf_finalize", writer_tail_bgzf_finalize_seconds),
+        ("pool_drop", writer_tail_pool_drop_seconds),
+    ]);
     let pipeline_start_elapsed = 0.0f64;
     let readers_started_elapsed =
         elapsed_micros_to_seconds(lifecycle.readers_started_micros.load(Ordering::Relaxed));
@@ -1950,7 +1940,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
         - compute_drain_after_producer_done_seconds
         - output_queue_drain_after_compute_done_seconds
         - ordered_writer_drain_after_compute_done_seconds
-        - writer_write_after_compute_done_seconds
         - writer_finalize_seconds
         - writer_join_overhead_seconds)
         .max(0.0);
@@ -1958,11 +1947,33 @@ fn run_direct(cli: &Cli) -> Result<()> {
         - (compute_drain_after_producer_done_seconds
             + output_queue_drain_after_compute_done_seconds
             + ordered_writer_drain_after_compute_done_seconds
-            + writer_write_after_compute_done_seconds
             + writer_finalize_seconds
             + writer_join_overhead_seconds
             + writer_tail_unclassified_seconds);
     let writer_tail_primary_cause = writer_drain_primary_cause;
+    let lifecycle_unattributed_seconds = (pipeline_start.elapsed().as_secs_f64()
+        - producer_phase_seconds
+        - compute_drain_after_producer_done_seconds
+        - output_queue_drain_after_compute_done_seconds
+        - ordered_writer_drain_after_compute_done_seconds
+        - writer_finalize_seconds
+        - writer_join_overhead_seconds)
+        .max(0.0);
+    let primary_bottleneck = classify_primary_bottleneck(&[
+        ("producer_phase", producer_phase_seconds),
+        ("compute_drain", compute_drain_after_producer_done_seconds),
+        (
+            "output_queue_drain",
+            output_queue_drain_after_compute_done_seconds,
+        ),
+        (
+            "ordered_writer_drain",
+            ordered_writer_drain_after_compute_done_seconds,
+        ),
+        ("writer_finalize", writer_finalize_seconds),
+        ("writer_join_overhead", writer_join_overhead_seconds),
+        ("unattributed", lifecycle_unattributed_seconds),
+    ]);
     stage_log(
         cli,
         format!(
@@ -1973,19 +1984,34 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE writer_tail_breakdown_exclusive producer_phase_seconds={:.6} compute_drain_after_producer_done_seconds={:.6} output_queue_drain_after_compute_done_seconds={:.6} ordered_writer_drain_after_compute_done_seconds={:.6} writer_write_after_compute_done_seconds={:.6} writer_finalize_seconds={:.6} writer_join_overhead_seconds={:.6} writer_tail_unclassified_seconds={:.6} end_to_end_seconds={:.6} writer_tail_accounting_error_seconds={:.6} writer_tail_primary_cause={}",
-            producer_phase_seconds, compute_drain_after_producer_done_seconds, output_queue_drain_after_compute_done_seconds, ordered_writer_drain_after_compute_done_seconds, writer_write_after_compute_done_seconds, writer_finalize_seconds, writer_join_overhead_seconds, writer_tail_unclassified_seconds, pipeline_start.elapsed().as_secs_f64(), writer_tail_accounting_error_seconds, writer_tail_primary_cause
+            "STAGE writer_tail_breakdown_exclusive producer_phase_wall_seconds_exclusive={:.6} compute_drain_after_producer_done_wall_seconds_exclusive={:.6} output_queue_drain_after_compute_done_wall_seconds_exclusive={:.6} ordered_writer_drain_after_compute_done_wall_seconds_exclusive={:.6} writer_finalize_wall_seconds_exclusive={:.6} writer_join_overhead_wall_seconds_exclusive={:.6} lifecycle_unattributed_wall_seconds_exclusive={:.6} writer_write_after_compute_done_seconds_cumulative={:.6} writer_tail_accounting_error_seconds={:.6} writer_tail_primary_cause={}",
+            producer_phase_seconds, compute_drain_after_producer_done_seconds, output_queue_drain_after_compute_done_seconds, ordered_writer_drain_after_compute_done_seconds, writer_finalize_seconds, writer_join_overhead_seconds, lifecycle_unattributed_seconds, writer_write_after_compute_done_seconds, writer_tail_accounting_error_seconds, writer_tail_primary_cause
         ),
     );
     stage_log(
         cli,
         format!(
-            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} total_output_drain_seconds={:.6} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} estimated_uncompressed_bytes_written={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
+            "STAGE direct_lifecycle_exclusive end_to_end_seconds={:.6} producer_phase_wall_seconds_exclusive={:.6} compute_drain_wall_seconds_exclusive={:.6} output_queue_drain_wall_seconds_exclusive={:.6} ordered_writer_drain_wall_seconds_exclusive={:.6} writer_finalize_wall_seconds_exclusive={:.6} writer_join_overhead_wall_seconds_exclusive={:.6} lifecycle_unattributed_wall_seconds_exclusive={:.6} primary_bottleneck={}",
+            pipeline_start.elapsed().as_secs_f64(),
+            producer_phase_seconds,
+            compute_drain_after_producer_done_seconds,
+            output_queue_drain_after_compute_done_seconds,
+            ordered_writer_drain_after_compute_done_seconds,
+            writer_finalize_seconds,
+            writer_join_overhead_seconds,
+            lifecycle_unattributed_seconds,
+            primary_bottleneck
+        ),
+    );
+    stage_log(
+        cli,
+        format!(
+            "STAGE direct_close_diagnostics write_call_seconds={:.6} hts_close_seconds={:.6} close_to_write_ratio={:.3} note={} output_finalize_non_tail_seconds={:.6} writer_periodic_flush_count={} writer_periodic_flush_seconds={:.6} writer_pre_close_flush_seconds={:.6} pending_batches_before_close={} records_written_before_close={} output_bytes_before_close={} output_bytes_after_close={} output_bytes_delta_close={} estimated_uncompressed_bytes_written={} shared_bgzf_pool_drop_seconds={:.6} output_bgzf_pool_drop_seconds={:.6}",
             write_call_seconds,
             writer_stats.hts_close_seconds,
             close_to_write_ratio,
             close_note,
-            total_output_drain_seconds,
+            output_finalize_non_tail_seconds,
             writer_stats.writer_periodic_flush_count,
             writer_stats.writer_periodic_flush_seconds,
             writer_stats.writer_pre_close_flush_seconds,
@@ -2019,7 +2045,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE output_flow_controller_summary submitted_batches={} received_batches={} written_batches={} output_debt_max_bytes={} output_debt_max_batches={} output_debt_max_seconds={:.6} output_debt_mean_seconds={:.6} ordered_pending_max_batches={} ordered_pending_max_bytes={} max_completed_batch_gap_at_writer={} compute_to_writer_queue_max_depth={} writer_write_bps_ema_final={:.3} output_batches_submitted_at_producer_done={} output_batches_received_at_producer_done={} output_batches_written_at_producer_done={} output_bytes_submitted_at_producer_done={} output_bytes_written_at_producer_done={} output_debt_bytes_at_producer_done={} output_debt_batches_at_producer_done={} ordered_pending_batches_at_producer_done={} ordered_pending_bytes_at_producer_done={} next_expected_batch_id_at_producer_done={} largest_completed_batch_id_at_producer_done={} completed_ahead_gap_at_producer_done={} input_wait_seconds_total={:.6} input_wait_events={} input_wait_max_seconds={:.6} compute_start_wait_seconds_total={:.6} compute_start_wait_events={} compute_start_wait_max_seconds={:.6} output_submit_wait_seconds_total={:.6} output_submit_wait_events={} output_submit_wait_max_seconds={:.6}",
+            "STAGE output_flow_controller_summary submitted_batches={} received_batches={} written_batches={} output_debt_max_bytes={} output_debt_max_batches={} output_debt_max_seconds={:.6} output_debt_mean_seconds={:.6} ordered_pending_max_batches={} ordered_pending_max_bytes={} max_completed_batch_gap_at_writer={} compute_to_writer_queue_max_depth={} writer_write_bps_ema_final={:.3} output_batches_submitted_at_producer_done={} output_batches_received_at_producer_done={} output_batches_written_at_producer_done={} output_bytes_submitted_at_producer_done={} output_bytes_written_at_producer_done={} output_debt_bytes_at_producer_done={} output_debt_batches_at_producer_done={} ordered_pending_batches_at_producer_done={} ordered_pending_bytes_at_producer_done={} next_expected_batch_id_at_producer_done={} largest_completed_batch_id_at_producer_done={} completed_ahead_gap_at_producer_done={} input_wait_seconds_cumulative={:.6} input_wait_events={} input_wait_max_seconds={:.6} compute_start_wait_seconds_cumulative={:.6} compute_start_wait_events={} compute_start_wait_max_seconds={:.6} output_submit_wait_seconds_cumulative={:.6} output_submit_wait_events={} output_submit_wait_max_seconds={:.6}",
             output_flow_snapshot.submitted_batches,
             output_flow_snapshot.received_batches,
             output_flow_snapshot.written_batches,
@@ -2073,10 +2099,36 @@ fn run_direct(cli: &Cli) -> Result<()> {
     );
     mark_elapsed_once(&lifecycle.pipeline_end_micros, pipeline_start);
     let end_to_end_seconds = pipeline_start.elapsed().as_secs_f64();
+    let output_gib = size_mb(&cli.output)? / 1024.0;
+    let groups_million = if stats.groups > 0 {
+        stats.groups as f64 / 1_000_000.0
+    } else {
+        0.0
+    };
+    let end_to_end_seconds_per_output_gib = if output_gib > 0.0 {
+        end_to_end_seconds / output_gib
+    } else {
+        0.0
+    };
+    let writer_tail_seconds_per_output_gib = if output_gib > 0.0 {
+        writer_drain_seconds / output_gib
+    } else {
+        0.0
+    };
+    let producer_phase_seconds_per_million_groups = if groups_million > 0.0 {
+        producer_phase_seconds / groups_million
+    } else {
+        0.0
+    };
+    let writer_tail_seconds_per_million_groups = if groups_million > 0.0 {
+        writer_drain_seconds / groups_million
+    } else {
+        0.0
+    };
     stage_log(
         cli,
         format!(
-            "STAGE direct_output_flow_summary end_to_end_seconds={:.6} producer_done_seconds={:.6} writer_tail_seconds={:.6} output_finalize_seconds={:.6} output_probe_seconds={:.6} output_pool_drop_seconds={:.6} total_output_pressure_seconds={:.6} output_debt_max_seconds={:.6} output_debt_mean_seconds={:.6} output_debt_max_bytes={} output_debt_max_batches={} output_debt_bytes_at_producer_done={} output_debt_batches_at_producer_done={} ordered_pending_max_batches={} ordered_pending_max_bytes={} ordered_pending_batches_at_producer_done={} ordered_pending_bytes_at_producer_done={} max_completed_batch_gap_at_writer={} completed_ahead_gap_at_producer_done={} compute_to_writer_queue_max_depth={} writer_drain_primary_cause={}",
+            "STAGE direct_output_flow_summary end_to_end_seconds={:.6} producer_done_seconds={:.6} writer_tail_seconds={:.6} output_finalize_seconds={:.6} output_probe_seconds={:.6} output_pool_drop_seconds={:.6} total_output_pressure_seconds={:.6} output_debt_max_seconds={:.6} output_debt_mean_seconds={:.6} output_debt_max_bytes={} output_debt_max_batches={} output_debt_bytes_at_producer_done={} output_debt_batches_at_producer_done={} ordered_pending_max_batches={} ordered_pending_max_bytes={} ordered_pending_batches_at_producer_done={} ordered_pending_bytes_at_producer_done={} max_completed_batch_gap_at_writer={} completed_ahead_gap_at_producer_done={} compute_to_writer_queue_max_depth={} writer_drain_primary_cause={} primary_bottleneck={} end_to_end_seconds_per_output_gib={:.6} writer_tail_seconds_per_output_gib={:.6} producer_phase_seconds_per_million_groups={:.6} writer_tail_seconds_per_million_groups={:.6}",
             end_to_end_seconds,
             producer_done_seconds,
             writer_drain_seconds,
@@ -2097,13 +2149,18 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_stats.max_completed_batch_gap_at_writer,
             output_flow_snapshot.completed_ahead_gap_at_producer_done,
             output_flow_snapshot.compute_to_writer_queue_max_depth,
-            writer_drain_primary_cause
+            writer_drain_primary_cause,
+            primary_bottleneck,
+            end_to_end_seconds_per_output_gib,
+            writer_tail_seconds_per_output_gib,
+            producer_phase_seconds_per_million_groups,
+            writer_tail_seconds_per_million_groups
         ),
     );
     stage_log(
         cli,
         format!(
-            "STAGE direct_total_summary requested_threads={} end_to_end_seconds={:.6} producer_done_seconds={:.6} writer_tail_seconds={:.6} read_match_seconds={:.6} output_finalize_seconds={:.6} output_probe_seconds={:.6} output_pool_drop_seconds={:.6} total_output_pressure_seconds={:.6} records_written={} output_mb={:.3} writer_write_bps_ema_final={:.3} writer_drain_primary_cause={}",
+            "STAGE direct_total_summary requested_threads={} end_to_end_seconds={:.6} producer_done_seconds={:.6} writer_tail_seconds={:.6} read_match_seconds={:.6} output_finalize_seconds={:.6} output_probe_seconds={:.6} output_pool_drop_seconds={:.6} total_output_pressure_seconds={:.6} records_written={} output_mb={:.3} output_gib={:.6} writer_write_bps_ema_final={:.3} writer_drain_primary_cause={} primary_bottleneck={} end_to_end_seconds_per_output_gib={:.6} writer_tail_seconds_per_output_gib={:.6} producer_phase_seconds_per_million_groups={:.6} writer_tail_seconds_per_million_groups={:.6}",
             thread_resolution.requested_threads,
             end_to_end_seconds,
             producer_done_seconds,
@@ -2115,8 +2172,14 @@ fn run_direct(cli: &Cli) -> Result<()> {
             total_output_pressure_seconds,
             writer_stats.records_written,
             size_mb(&cli.output)?,
+            output_gib,
             output_flow_snapshot.writer_write_bps_ema,
-            writer_drain_primary_cause
+            writer_drain_primary_cause,
+            primary_bottleneck,
+            end_to_end_seconds_per_output_gib,
+            writer_tail_seconds_per_output_gib,
+            producer_phase_seconds_per_million_groups,
+            writer_tail_seconds_per_million_groups
         ),
     );
     Ok(())
@@ -3507,7 +3570,7 @@ fn direct_writer_thread(
     worker_stats.file_sync_or_drop_seconds = sync_start.elapsed().as_secs_f64();
     mark_elapsed_once(&lifecycle.writer_finalize_done_micros, pipeline_start);
     worker_stats.bgzf_flush_seconds = 0.0;
-    worker_stats.total_output_drain_seconds = worker_stats.writer_periodic_flush_seconds
+    worker_stats.output_finalize_non_tail_seconds = worker_stats.writer_periodic_flush_seconds
         + worker_stats.writer_pre_close_flush_seconds
         + worker_stats.hts_close_seconds;
     mark_elapsed_once(&lifecycle.writer_thread_exit_micros, pipeline_start);
@@ -3521,6 +3584,18 @@ fn percentile_seconds(samples: &mut [f64], percentile: f64) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(CmpOrdering::Equal));
     let idx = (((samples.len() - 1) as f64) * (percentile / 100.0)).round() as usize;
     samples[idx.min(samples.len() - 1)]
+}
+
+fn classify_primary_bottleneck(parts: &[(&'static str, f64)]) -> &'static str {
+    let mut sorted = parts.to_vec();
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
+    if sorted.is_empty() || sorted[0].1 <= 0.0 {
+        return "unknown";
+    }
+    if sorted.len() > 1 && sorted[1].1 > sorted[0].1 * 0.75 {
+        return "mixed";
+    }
+    sorted[0].0
 }
 
 fn format_u64_slice(values: &[u64]) -> String {

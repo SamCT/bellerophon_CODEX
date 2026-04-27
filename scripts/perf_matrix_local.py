@@ -22,16 +22,37 @@ def parse_csv_strs(value):
     return [v.strip() for v in value.split(',') if v.strip()]
 
 
-def run_one(args, runner, strategy, quality, threads, base_dir):
+def git_commit_sha(repo_dir):
+    try:
+        return subprocess.check_output(
+            ['git', '-C', repo_dir, 'rev-parse', 'HEAD'],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return ''
+
+
+def run_one(args, runner, strategy, quality, threads, base_dir, run_order, commit_sha):
     run_id = f'r{runner}_s{strategy}_q{quality}_t{threads}'
     run_dir = os.path.join(base_dir, run_id)
     os.makedirs(run_dir, exist_ok=True)
     output_bam = os.path.join(run_dir, 'out.bam')
     time_txt = os.path.join(run_dir, 'time.txt')
     log_txt = os.path.join(run_dir, 'run.log')
+    meta_txt = os.path.join(run_dir, 'run_meta.txt')
 
     env = os.environ.copy()
     env['BELLEROPHON_IO_THREADS_STRATEGY'] = strategy
+    with open(meta_txt, 'w', encoding='utf-8') as meta_fh:
+        meta_fh.write(f'run_order={run_order}\n')
+        meta_fh.write(f'commit_sha={commit_sha}\n')
+        meta_fh.write(f'hostname={env.get("HOSTNAME", "")}\n')
+        meta_fh.write(f'slurm_job_id={env.get("SLURM_JOB_ID", "")}\n')
+        meta_fh.write(f'pbs_jobid={env.get("PBS_JOBID", "")}\n')
+        meta_fh.write(f'lsb_jobid={env.get("LSB_JOBID", "")}\n')
+        meta_fh.write(f'runner={runner}\n')
+        meta_fh.write(f'strategy={strategy}\n')
 
     if runner == 'python':
         cmd = [
@@ -104,13 +125,16 @@ def main():
 
     os.makedirs(args.matrix_dir, exist_ok=True)
 
+    commit_sha = git_commit_sha(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    run_order = 0
     for runner in runners:
         if runner not in RUNNER_PIPELINE:
             raise SystemExit(f'Unknown runner: {runner}')
         runner_strategies = strategies if runner == 'python' else [args.rust_strategy]
         for quality, thread_count, strategy in itertools.product(qualities, threads, runner_strategies):
+            run_order += 1
             print(f'Running {runner} q={quality} t={thread_count} strategy={strategy}')
-            run_one(args, runner, strategy, quality, thread_count, args.matrix_dir)
+            run_one(args, runner, strategy, quality, thread_count, args.matrix_dir, run_order, commit_sha)
 
     print(f'Done. Collect with: python scripts/perf_matrix_collect.py --matrix-dir {args.matrix_dir}')
 
