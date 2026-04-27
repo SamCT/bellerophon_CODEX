@@ -128,6 +128,7 @@ def parse_stage_metrics(path):
     row.update(parse_stage_kv('direct_reader_diagnostics'))
     row.update(parse_stage_kv('direct_pipeline_diagnostics'))
     row.update(parse_stage_kv('direct_total_summary'))
+    row.update(parse_stage_kv('direct_thread_resolution'))
 
     legacy_total = parse_stage_kv('direct_summary').get('total_output_drain_seconds')
     if legacy_total and 'writer_tail_seconds' in row:
@@ -145,6 +146,7 @@ def parse_stage_metrics(path):
         'sync_wait_forward_seconds': 'sync_wait_for_forward_chunk_seconds',
         'sync_wait_reverse_seconds': 'sync_wait_for_reverse_chunk_seconds',
         'writer_tail_primary_cause': 'writer_drain_primary_cause',
+        'wall_time': 'wall_seconds',
     }
     for out_key, source_key in aliases.items():
         if out_key not in row and source_key in row:

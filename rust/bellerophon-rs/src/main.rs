@@ -629,7 +629,7 @@ struct QueueDepthStats {
     occupancy_samples: u64,
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct SyncDiagnostics {
     wait_for_forward_chunk_seconds: f64,
     wait_for_reverse_chunk_seconds: f64,
@@ -641,6 +641,31 @@ struct SyncDiagnostics {
     reverse_try_recv_hits: u64,
     forward_blocking_recv_when_reverse_work_available: u64,
     reverse_blocking_recv_when_forward_work_available: u64,
+    slow_side_detected: &'static str,
+    slow_side_switch_count: u64,
+    max_consecutive_waits_forward: u64,
+    max_consecutive_waits_reverse: u64,
+}
+
+impl Default for SyncDiagnostics {
+    fn default() -> Self {
+        Self {
+            wait_for_forward_chunk_seconds: 0.0,
+            wait_for_reverse_chunk_seconds: 0.0,
+            match_loop_seconds: 0.0,
+            output_enqueue_seconds: 0.0,
+            forward_recv_calls: 0,
+            reverse_recv_calls: 0,
+            forward_try_recv_hits: 0,
+            reverse_try_recv_hits: 0,
+            forward_blocking_recv_when_reverse_work_available: 0,
+            reverse_blocking_recv_when_forward_work_available: 0,
+            slow_side_detected: "unknown",
+            slow_side_switch_count: 0,
+            max_consecutive_waits_forward: 0,
+            max_consecutive_waits_reverse: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1288,6 +1313,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 &mut groups_seen,
                 &mut pair_match_assembly_seconds,
                 cli.direct_sync_lookahead_groups,
+                queue_policy.reader_queue_capacity,
                 queue_policy.output_queue_capacity,
                 &mut output_queue_full_events,
                 &mut sync_diagnostics,
@@ -1673,7 +1699,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
     stage_log(
         cli,
         format!(
-            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} input_to_compute_queue_max_depth={} input_to_compute_queue_capacity={} compute_to_writer_queue_max_depth={} compute_to_writer_queue_capacity={} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} sync_forward_recv_calls={} sync_reverse_recv_calls={} sync_forward_try_recv_hits={} sync_reverse_try_recv_hits={} sync_forward_blocking_recv_when_reverse_work_available={} sync_reverse_blocking_recv_when_forward_work_available={} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} input_batches_submitted={} output_batches_submitted={} batches_created={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} input_to_compute_queue_full_events={} compute_to_writer_queue_full_events={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
+            "STAGE direct_pipeline_diagnostics writer_wait_for_sequence_seconds={:.6} input_to_compute_queue_max_depth={} input_to_compute_queue_capacity={} compute_to_writer_queue_max_depth={} compute_to_writer_queue_capacity={} matcher_output_queue_max_depth={} matcher_output_queue_capacity={} reader_chunk_queue_max_depth={} reader_chunk_queue_capacity={} producer_blocked_seconds={:.6} matcher_send_wait_seconds={:.6} forward_reader_send_wait_seconds={:.6} reverse_reader_send_wait_seconds={:.6} writer_idle_seconds={:.6} sync_wait_for_forward_chunk_seconds={:.6} sync_wait_for_reverse_chunk_seconds={:.6} sync_match_loop_seconds={:.6} sync_output_enqueue_seconds={:.6} sync_forward_recv_calls={} sync_reverse_recv_calls={} sync_forward_try_recv_hits={} sync_reverse_try_recv_hits={} sync_forward_blocking_recv_when_reverse_work_available={} sync_reverse_blocking_recv_when_forward_work_available={} sync_slow_side_detected={} sync_slow_side_switch_count={} sync_max_consecutive_waits_forward={} sync_max_consecutive_waits_reverse={} batches_processed={} writer_receive_count={} average_batch_size={:.3} max_batch_size={} input_batches_submitted={} output_batches_submitted={} batches_created={} pending_batches_before_close={} records_written={} writer_records_per_second={:.3} writer_batches_per_second={:.3} writer_write_call_seconds={:.6} writer_process_seconds={:.6} writer_filter_seconds={:.6} writer_actual_bam_write_seconds={:.6} writer_output_queue_receive_wait_seconds={:.6} average_records_per_writer_batch={:.3} estimated_uncompressed_bytes_written={} input_to_compute_queue_full_events={} compute_to_writer_queue_full_events={} matcher_output_queue_full_events={} reader_chunk_queue_full_events={} total_queue_full_events={} average_chunk_groups={:.3} max_chunk_groups={} reader_chunk_queue_occupancy_mean={:.3} forward_reader_chunks_sent={} reverse_reader_chunks_sent={} direct_output_queue_capacity={} direct_reader_queue_capacity={} direct_reader_chunk_groups={} direct_batch_size={} direct_queue_policy=auto_bounded bgzf_worker_utilization=not_exposed_by_htslib_api",
             writer_recv_wait_seconds,
             max_input_queue_depth,
             queue_policy.output_queue_capacity,
@@ -1698,6 +1724,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
             sync_diagnostics.reverse_try_recv_hits,
             sync_diagnostics.forward_blocking_recv_when_reverse_work_available,
             sync_diagnostics.reverse_blocking_recv_when_forward_work_available,
+            sync_diagnostics.slow_side_detected,
+            sync_diagnostics.slow_side_switch_count,
+            sync_diagnostics.max_consecutive_waits_forward,
+            sync_diagnostics.max_consecutive_waits_reverse,
             batches_processed,
             writer_receive_count,
             average_batch_size,
@@ -2361,6 +2391,7 @@ fn sync_parallel_reader_groups(
     groups_seen: &mut u64,
     pair_match_assembly_seconds: &mut f64,
     max_lookahead_groups: usize,
+    reader_chunk_queue_capacity: usize,
     matcher_output_queue_capacity: usize,
     output_queue_full_events: &mut u64,
     sync_diagnostics: &mut SyncDiagnostics,
@@ -2371,19 +2402,74 @@ fn sync_parallel_reader_groups(
     lifecycle: &Arc<PipelineLifecycleMarkers>,
 ) -> Result<()> {
     const SYNC_PREFETCH_TARGET_CHUNKS: usize = 2;
+    const SYNC_PREFETCH_IMBALANCED_CHUNKS: usize = 4;
+    const SYNC_SLOW_SIDE_MIN_WAITS: u64 = 8;
+    const SYNC_SLOW_SIDE_WAIT_RATIO: f64 = 1.6;
+    const SYNC_SLOW_SIDE_WAIT_SECONDS_DELTA: f64 = 0.050;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SlowSide {
+        Forward,
+        Reverse,
+        Balanced,
+        Unknown,
+    }
+    impl SlowSide {
+        fn as_stage_value(self) -> &'static str {
+            match self {
+                SlowSide::Forward => "forward",
+                SlowSide::Reverse => "reverse",
+                SlowSide::Balanced => "balanced",
+                SlowSide::Unknown => "unknown",
+            }
+        }
+    }
+    let classify_slow_side = |diag: &SyncDiagnostics| -> SlowSide {
+        let total_wait_calls = diag.forward_recv_calls + diag.reverse_recv_calls;
+        if total_wait_calls < SYNC_SLOW_SIDE_MIN_WAITS {
+            return SlowSide::Unknown;
+        }
+        let forward_wait = diag.wait_for_forward_chunk_seconds.max(0.0);
+        let reverse_wait = diag.wait_for_reverse_chunk_seconds.max(0.0);
+        if reverse_wait > forward_wait * SYNC_SLOW_SIDE_WAIT_RATIO
+            && reverse_wait - forward_wait > SYNC_SLOW_SIDE_WAIT_SECONDS_DELTA
+        {
+            SlowSide::Reverse
+        } else if forward_wait > reverse_wait * SYNC_SLOW_SIDE_WAIT_RATIO
+            && forward_wait - reverse_wait > SYNC_SLOW_SIDE_WAIT_SECONDS_DELTA
+        {
+            SlowSide::Forward
+        } else {
+            SlowSide::Balanced
+        }
+    };
     let mut forward_queue: VecDeque<DirectRecordGroup> = VecDeque::new();
     let mut reverse_queue: VecDeque<DirectRecordGroup> = VecDeque::new();
     let mut pending_forward: BTreeMap<Vec<u8>, DirectRecordGroup> = BTreeMap::new();
     let mut pending_reverse: BTreeMap<Vec<u8>, DirectRecordGroup> = BTreeMap::new();
     let mut forward_done = false;
     let mut reverse_done = false;
+    let mut last_slow_side = SlowSide::Unknown;
+    let mut consecutive_waits_forward = 0u64;
+    let mut consecutive_waits_reverse = 0u64;
 
     loop {
+        let current_slow_side = classify_slow_side(sync_diagnostics);
+        if current_slow_side != SlowSide::Unknown && current_slow_side != last_slow_side {
+            if last_slow_side != SlowSide::Unknown {
+                sync_diagnostics.slow_side_switch_count += 1;
+            }
+            last_slow_side = current_slow_side;
+        }
+        sync_diagnostics.slow_side_detected = current_slow_side.as_stage_value();
+        let adaptive_prefetch_chunks = match current_slow_side {
+            SlowSide::Forward | SlowSide::Reverse => SYNC_PREFETCH_IMBALANCED_CHUNKS,
+            SlowSide::Balanced | SlowSide::Unknown => SYNC_PREFETCH_TARGET_CHUNKS,
+        }
+        .min(reader_chunk_queue_capacity.max(1));
+        let adaptive_prefetch_groups = adaptive_prefetch_chunks * direct_batch_size;
         let mut drain_forward_try_recv = |sync_diagnostics: &mut SyncDiagnostics| -> Result<()> {
             loop {
-                if forward_done
-                    || forward_queue.len() >= SYNC_PREFETCH_TARGET_CHUNKS * direct_batch_size
-                {
+                if forward_done || forward_queue.len() >= adaptive_prefetch_groups {
                     break;
                 }
                 match forward_rx.try_recv() {
@@ -2412,9 +2498,7 @@ fn sync_parallel_reader_groups(
         };
         let mut drain_reverse_try_recv = |sync_diagnostics: &mut SyncDiagnostics| -> Result<()> {
             loop {
-                if reverse_done
-                    || reverse_queue.len() >= SYNC_PREFETCH_TARGET_CHUNKS * direct_batch_size
-                {
+                if reverse_done || reverse_queue.len() >= adaptive_prefetch_groups {
                     break;
                 }
                 match reverse_rx.try_recv() {
@@ -2459,6 +2543,11 @@ fn sync_parallel_reader_groups(
                 .recv()
                 .context("failed to receive forward chunk")??;
             sync_diagnostics.wait_for_forward_chunk_seconds += wait_start.elapsed().as_secs_f64();
+            consecutive_waits_forward += 1;
+            consecutive_waits_reverse = 0;
+            sync_diagnostics.max_consecutive_waits_forward = sync_diagnostics
+                .max_consecutive_waits_forward
+                .max(consecutive_waits_forward);
             forward_chunk_depth.fetch_sub(1, Ordering::Relaxed);
             match next_forward_chunk {
                 Some(chunk) => {
@@ -2479,6 +2568,11 @@ fn sync_parallel_reader_groups(
                 .recv()
                 .context("failed to receive reverse chunk")??;
             sync_diagnostics.wait_for_reverse_chunk_seconds += wait_start.elapsed().as_secs_f64();
+            consecutive_waits_reverse += 1;
+            consecutive_waits_forward = 0;
+            sync_diagnostics.max_consecutive_waits_reverse = sync_diagnostics
+                .max_consecutive_waits_reverse
+                .max(consecutive_waits_reverse);
             reverse_chunk_depth.fetch_sub(1, Ordering::Relaxed);
             match next_reverse_chunk {
                 Some(chunk) => {
@@ -2492,6 +2586,8 @@ fn sync_parallel_reader_groups(
 
         if let (Some(f), Some(r)) = (forward_queue.front(), reverse_queue.front()) {
             let match_start = Instant::now();
+            consecutive_waits_forward = 0;
+            consecutive_waits_reverse = 0;
             match f.qname().cmp(r.qname()) {
                 CmpOrdering::Equal => {
                     let f_group = forward_queue.pop_front().expect("queue checked");
