@@ -2629,15 +2629,7 @@ fn sync_parallel_reader_groups(
                     None => forward_done = true,
                 }
             } else {
-                drain_reader_try_recv(
-                    reverse_rx,
-                    &mut reverse_queue,
-                    &mut reverse_done,
-                    reverse_chunk_depth,
-                    adaptive_prefetch_groups,
-                    &mut sync_diagnostics.reverse_try_recv_hits,
-                    "reverse",
-                )?;
+                drain_reverse_try_recv(sync_diagnostics)?;
             }
         }
         if !reverse_done && reverse_queue.is_empty() && !can_make_progress_with_forward_only {
@@ -2680,15 +2672,7 @@ fn sync_parallel_reader_groups(
                     None => reverse_done = true,
                 }
             } else {
-                drain_reader_try_recv(
-                    forward_rx,
-                    &mut forward_queue,
-                    &mut forward_done,
-                    forward_chunk_depth,
-                    adaptive_prefetch_groups,
-                    &mut sync_diagnostics.forward_try_recv_hits,
-                    "forward",
-                )?;
+                drain_forward_try_recv(sync_diagnostics)?;
             }
         }
 
@@ -3157,7 +3141,7 @@ impl OutputFlowController {
         let (debt_byte_limit, debt_batch_limit, ordered_limit, _) =
             Self::dynamic_limits(inner, max_compute_workers);
         let writer_progress_age = inner.writer_last_progress_time.elapsed().as_secs_f64();
-        let writer_recent_progress = writer_progress_age <= OUTPUT_SUBMIT_RECENT_PROGRESS_SECONDS;
+        let writer_recent_progress = writer_progress_age <= inner.flow_target_backlog_seconds;
         let severe_pressure = debt_bytes > debt_byte_limit.saturating_mul(2)
             || debt_batches > debt_batch_limit.saturating_mul(2)
             || inner.ordered_pending_bytes_estimate > debt_byte_limit.saturating_mul(2)
