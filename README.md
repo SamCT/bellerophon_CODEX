@@ -57,20 +57,6 @@ pixi run help
 pixi run install-local
 ```
 
-## Example hqsub command
-
-Use the installed executable directly in scheduler jobs:
-
-```bash
-hqsub -q normal -c 64 -m 240G -t 24:00:00 -- \
-  bellerophon-rs \
-    --forward LilacH1_Final_smask_HIC_R1_raw.bam \
-    --reverse LilacH1_Final_smask_HIC_R2_raw.bam \
-    --threads 64 \
-    --quality 10 \
-    --output LilacH1_concat_bell_q10_P64_RS.bam
-```
-
 ## Help
 bellerophon-rs [-h] --forward FORWARD --reverse REVERSE --output OUTPUT [--quality QUALITY] [--threads THREADS] [--log-level {CRITICAL,ERROR,WARNING,INFO,DEBUG}] [--version]
 
