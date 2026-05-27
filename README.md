@@ -6,37 +6,73 @@ Rust-first implementation of the Bellerophon pipeline: filter mapped reads where
 
 This repository now ships the optimized direct Rust pipeline as the primary and only supported implementation.
 
-## Quick start (Pixi) and installation
+## Quick start
 
 ```bash
-pixi install
-pixi run bellerophon --help
+bellerophon-rs \
+  --forward R1.bam \
+  --reverse R2.bam \
+  --threads 64 \
+  --quality 10 \
+  --output out.bam
 ```
 
+Relative input and output paths are resolved relative to the shell directory
+where `bellerophon-rs` is launched.
+
+## Install
+
+Install into `~/.local/bin`:
+
 ```bash
-pixi run cargo-build-rs
-pixi run cargo-test-rs
+scripts/install_bellerophon_rs.sh "$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Install into a custom shared prefix:
+
+```bash
+scripts/install_bellerophon_rs.sh /nfs7/path/to/bellerophon-rs
+export PATH="/nfs7/path/to/bellerophon-rs/bin:$PATH"
 ```
 
 ## Manual cargo usage
 
 ```bash
 cargo build --release --manifest-path rust/bellerophon-rs/Cargo.toml
-cargo run --release --manifest-path rust/bellerophon-rs/Cargo.toml -- --help
+cargo run --release --manifest-path rust/bellerophon-rs/Cargo.toml -- \
+  --forward test_data/test_1500_forward.bam \
+  --reverse test_data/test_1500_reverse.bam \
+  --threads 2 \
+  --quality 10 \
+  --output /tmp/bellerophon-rs.example.bam
 ```
 
-## Example command
+Pixi is kept for development tasks only:
+
 ```bash
-pixi run bellerophon \
-  --forward /path/to/sample_R1.bam \
-  --reverse /path/to/sample_R2.bam \
-  --output sample.bellerophon.q0.bam \
-  --quality 0 \
-  --threads 16
+pixi run build
+pixi run test
+pixi run help
+pixi run install-local
+```
+
+## Example hqsub command
+
+Use the installed executable directly in scheduler jobs:
+
+```bash
+hqsub -q normal -c 64 -m 240G -t 24:00:00 -- \
+  bellerophon-rs \
+    --forward LilacH1_Final_smask_HIC_R1_raw.bam \
+    --reverse LilacH1_Final_smask_HIC_R2_raw.bam \
+    --threads 64 \
+    --quality 10 \
+    --output LilacH1_concat_bell_q10_P64_RS.bam
 ```
 
 ## Help
-bellerophon [-h] --forward FORWARD --reverse REVERSE --output OUTPUT [--quality QUALITY] [--threads THREADS] [--log-level {CRITICAL,ERROR,WARNING,INFO,DEBUG}] [--version]
+bellerophon-rs [-h] --forward FORWARD --reverse REVERSE --output OUTPUT [--quality QUALITY] [--threads THREADS] [--log-level {CRITICAL,ERROR,WARNING,INFO,DEBUG}] [--version]
 
 Filter chimeric reads.
 

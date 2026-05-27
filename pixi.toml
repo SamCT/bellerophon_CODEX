@@ -14,7 +14,7 @@ make = ">=4.4.1,<5"
 libclang = ">=22.1.4,<23"
 
 [tasks]
-bellerophon = "cargo run --release --manifest-path rust/bellerophon-rs/Cargo.toml -- --help"
-cargo-build-rs = "cargo build --release --manifest-path rust/bellerophon-rs/Cargo.toml"
-cargo-test-rs = "cargo test --manifest-path rust/bellerophon-rs/Cargo.toml"
-cargo-help-rs = "cargo run --release --manifest-path rust/bellerophon-rs/Cargo.toml -- --help"
+build = "bash -lc 'export LIBCLANG_PATH=\"${CONDA_PREFIX:-$PIXI_PROJECT_ROOT/.pixi/envs/default}/lib\"; cargo build --release --manifest-path rust/bellerophon-rs/Cargo.toml'"
+test = "bash -lc 'export LIBCLANG_PATH=\"${CONDA_PREFIX:-$PIXI_PROJECT_ROOT/.pixi/envs/default}/lib\"; cargo test --manifest-path rust/bellerophon-rs/Cargo.toml'"
+help = "bash -lc 'export LIBCLANG_PATH=\"${CONDA_PREFIX:-$PIXI_PROJECT_ROOT/.pixi/envs/default}/lib\"; cargo run --release --manifest-path rust/bellerophon-rs/Cargo.toml -- --help'"
+install-local = "bash -lc 'export LIBCLANG_PATH=\"${CONDA_PREFIX:-$PIXI_PROJECT_ROOT/.pixi/envs/default}/lib\"; bash scripts/install_bellerophon_rs.sh \"${BELLEROPHON_RS_PREFIX:-$PIXI_PROJECT_ROOT/.pixi-local}\"'"
