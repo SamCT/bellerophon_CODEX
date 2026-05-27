@@ -3,10 +3,6 @@ name = "bellerophon-rs"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "bellerophon-rs"
-path = "src/main.rs"
-
 [dependencies]
 crossbeam-channel = "0.5"
 anyhow = "1.0"
@@ -14,10 +10,10 @@ clap = { version = "4.5", features = ["derive"] }
 noodles-bam = "0.79"
 noodles-bgzf = "0.37"
 noodles-sam = "0.75"
-rust-htslib = { version = "1.0.0", default-features = false, features = ["libdeflate"] }
+# rust-htslib has not published a 1.x release yet; 0.51.0 is the
+# currently integrated API surface in this codebase/lockfile.
+rust-htslib = { path = "../../vendor/rust-htslib-0.51.0", default-features = false, features = ["libdeflate"] }
 tempfile = "3.13"
 
 [dev-dependencies]
-assert_cmd = "2.0"
 pretty_assertions = "1.4"
-wait-timeout = "0.2"

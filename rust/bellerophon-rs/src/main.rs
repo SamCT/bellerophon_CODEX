@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::thread;
@@ -50,7 +50,7 @@ enum LogLevel {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "bellerophon-rs", version)]
+#[command(name = "bellerophon-rs")]
 struct Cli {
     #[arg(short = 'f', long = "forward")]
     forward: PathBuf,
@@ -68,7 +68,7 @@ struct Cli {
     /// If omitted, HTSlib default is used.
     #[arg(long = "compression-level", value_parser = clap::value_parser!(u8).range(0..=9))]
     compression_level: Option<u8>,
-    #[arg(short = 'l', long = "log-level", default_value = "info")]
+    #[arg(short = 'l', long = "log-level", default_value = "error")]
     log_level: LogLevel,
     #[arg(long = "pipeline", value_enum, hide = true, default_value = "direct")]
     pipeline: Pipeline,
@@ -80,7 +80,7 @@ struct Cli {
         long = "direct-htslib-pool-mode",
         value_enum,
         default_value = "shared",
-        help = "Legacy diagnostics flag. The direct pipeline uses per-handle HTSlib threads with rust-htslib 1.x."
+        help = "HTSlib BGZF pool mode. 'split-per-handle' is experimental and slower/pathological on current HPC evidence."
     )]
     direct_htslib_pool_mode: DirectHtslibPoolMode,
     /// Reader execution mode for direct pipeline diagnostics.
@@ -97,12 +97,6 @@ struct Cli {
     /// Maximum number of unmatched groups allowed in bounded QNAME synchronization.
     #[arg(long = "direct-sync-lookahead-groups", default_value_t = 8192)]
     direct_sync_lookahead_groups: usize,
-    /// Print a direct-pipeline diagnostic if no queue/read/write progress is observed for N seconds.
-    #[arg(long = "stall-timeout-seconds")]
-    stall_timeout_seconds: Option<u64>,
-    /// Abort the process after printing a stall diagnostic.
-    #[arg(long = "abort-on-stall", default_value_t = false)]
-    abort_on_stall: bool,
     #[arg(long = "tmp-dir", default_value = ".")]
     tmp_dir: PathBuf,
 }
@@ -183,15 +177,6 @@ struct DirectOutputBatch {
     filter_seconds: f64,
 }
 
-#[allow(dead_code)]
-#[derive(Debug)]
-enum WriterMessage {
-    Batch(DirectOutputBatch),
-    Done { total_batches: u64 },
-    Error(String),
-}
-
-#[allow(dead_code)]
 #[derive(Default)]
 struct DirectWorkerStats {
     pair_stats: PairFilterStats,
@@ -242,7 +227,6 @@ struct DirectWorkerStats {
     pending_batches_before_close: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 struct DirectWriterRuntimeConfig {
     flow_target_backlog_seconds: f64,
@@ -488,7 +472,6 @@ fn elapsed_micros_to_seconds(value: u64) -> f64 {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Default, Clone, Debug)]
 struct OutputFlowStats {
     input_flow_control_wait_seconds: f64,
@@ -520,7 +503,6 @@ struct OutputFlowWaitDiagnostics {
     output_submit_wait_max_seconds: f64,
 }
 
-#[allow(dead_code)]
 #[derive(Default, Clone, Debug)]
 struct OutputFlowSnapshot {
     submitted_batches: u64,
@@ -615,7 +597,6 @@ struct OutputFlowInner {
     wait_diagnostics: OutputFlowWaitDiagnostics,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct OutputFlowController {
     inner: Mutex<OutputFlowInner>,
@@ -683,7 +664,6 @@ struct ReaderDecodeStats {
     decode_only_seconds: f64,
     group_build_seconds: f64,
     htslib_read_seconds: f64,
-    groups_decoded: u64,
     records_decoded: u64,
     send_wait_seconds: f64,
     chunks_sent: u64,
@@ -1096,37 +1076,38 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let reverse_header_reader = bam::Reader::from_path(&cli.reverse)
         .with_context(|| format!("failed to open reverse input {}", cli.reverse.display()))?;
     let split_workers = resolve_split_bgzf_workers(thread_resolution.total_bgzf_workers);
+    let mut shared_bgzf_pool: Option<ThreadPool> = None;
+    let mut output_bgzf_pool: Option<ThreadPool> = None;
+    if thread_resolution.htslib_pool_enabled
+        && cli.direct_htslib_pool_mode == DirectHtslibPoolMode::Shared
+        && thread_resolution.total_bgzf_workers > 0
+    {
+        shared_bgzf_pool = Some(
+            ThreadPool::new(thread_resolution.total_bgzf_workers as u32)
+                .context("failed to create shared BGZF thread pool")?,
+        );
+    }
     verify_matching_references(
         forward_header_reader.header(),
         reverse_header_reader.header(),
     )?;
 
-    let output_header = bam::Header::from_template(forward_header_reader.header());
-    let forward_bgzf_threads = split_workers.forward;
-    let reverse_bgzf_threads = split_workers.reverse;
-    let output_bgzf_threads = split_workers.output;
-    // Keep the HTSlib output pool owned by the coordinator until after the writer
-    // joins; the BGZF EOF marker is emitted during writer drop/close.
-    let mut shared_bgzf_pool: Option<ThreadPool> = None;
-    let mut output_bgzf_pool: Option<ThreadPool> = None;
-    let mut output_writer = Writer::from_path(&cli.output, &output_header, bam::Format::Bam)
+    let header = bam::Header::from_template(forward_header_reader.header());
+    let mut output = Writer::from_path(&cli.output, &header, bam::Format::Bam)
         .with_context(|| format!("failed to create output {}", cli.output.display()))?;
     match cli.direct_htslib_pool_mode {
         DirectHtslibPoolMode::Shared => {
-            if thread_resolution.htslib_pool_enabled && output_bgzf_threads > 0 {
-                let pool = ThreadPool::new(output_bgzf_threads as u32)
-                    .context("failed to create output BGZF thread pool")?;
-                output_writer
-                    .set_thread_pool(&pool)
-                    .context("failed to attach output BGZF pool to output writer")?;
-                shared_bgzf_pool = Some(pool);
+            if let Some(pool) = shared_bgzf_pool.as_ref() {
+                output
+                    .set_thread_pool(pool)
+                    .context("failed to attach shared BGZF pool to output")?;
             }
         }
         DirectHtslibPoolMode::SplitPerHandle => {
-            if output_bgzf_threads > 0 {
-                let pool = ThreadPool::new(output_bgzf_threads as u32)
+            if split_workers.output > 0 {
+                let pool = ThreadPool::new(split_workers.output as u32)
                     .context("failed to create output BGZF thread pool")?;
-                output_writer
+                output
                     .set_thread_pool(&pool)
                     .context("failed to attach output BGZF pool to output writer")?;
                 output_bgzf_pool = Some(pool);
@@ -1134,17 +1115,16 @@ fn run_direct(cli: &Cli) -> Result<()> {
         }
     }
     if let Some(level) = cli.compression_level {
-        output_writer
+        output
             .set_compression_level(compression_level_from_u8(level))
             .with_context(|| format!("failed to set output compression level {level}"))?;
     }
     let (input_batch_sender, input_batch_receiver) =
         sync_channel::<DirectInputBatch>(queue_policy.output_queue_capacity);
     let (output_batch_sender, output_batch_receiver) =
-        sync_channel::<WriterMessage>(queue_policy.output_queue_capacity);
+        sync_channel::<DirectOutputBatch>(queue_policy.output_queue_capacity);
     let input_queue_depth = Arc::new(AtomicUsize::new(0));
     let input_queue_max_depth = Arc::new(AtomicUsize::new(0));
-    let reader_queue_depth = Arc::new(AtomicUsize::new(0));
     let output_queue_submitted = Arc::new(AtomicU64::new(0));
     let output_queue_received = Arc::new(AtomicU64::new(0));
     let output_queue_max_depth = Arc::new(AtomicUsize::new(0));
@@ -1152,11 +1132,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let output_bytes_written = Arc::new(AtomicU64::new(0));
     let writer_bytes_per_second_estimate = Arc::new(AtomicU64::new(0));
     let writer_last_progress_micros = Arc::new(AtomicU64::new(0));
-    let forward_reader_done = Arc::new(AtomicBool::new(false));
-    let reverse_reader_done = Arc::new(AtomicBool::new(false));
-    let compute_workers_alive = Arc::new(AtomicUsize::new(thread_resolution.compute_workers));
-    let writer_alive = Arc::new(AtomicBool::new(true));
-    let watchdog_shutdown = Arc::new(AtomicBool::new(false));
     let pipeline_start = Instant::now();
     let lifecycle = Arc::new(PipelineLifecycleMarkers::default());
     let writer_runtime_config = resolve_direct_writer_runtime_config(
@@ -1168,10 +1143,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
         Arc::new(OutputFlowController::new(thread_resolution.compute_workers));
     let input_batch_receiver = Arc::new(Mutex::new(input_batch_receiver));
     let mut compute_handles = Vec::with_capacity(thread_resolution.compute_workers);
-    stage_log_always(format!(
-        "STAGE direct_compute_started workers={}",
-        thread_resolution.compute_workers
-    ));
     for worker_id in 0..thread_resolution.compute_workers {
         let worker_receiver = Arc::clone(&input_batch_receiver);
         let worker_sender = output_batch_sender.clone();
@@ -1188,37 +1159,33 @@ fn run_direct(cli: &Cli) -> Result<()> {
         let worker_writer_next_expected_batch_id =
             Arc::clone(&ordered_writer_next_expected_batch_id);
         let worker_output_flow_controller = Arc::clone(&output_flow_controller);
-        let worker_compute_workers_alive = Arc::clone(&compute_workers_alive);
         let worker_output_queue_capacity = queue_policy.output_queue_capacity;
         let worker_pipeline_start = pipeline_start;
         let worker_lifecycle = Arc::clone(&lifecycle);
-        compute_handles.push((
-            worker_id,
-            thread::spawn(move || {
-                direct_compute_thread(
-                    worker_id,
-                    worker_receiver,
-                    worker_sender,
-                    worker_quality,
-                    worker_input_queue_depth,
-                    worker_output_queue_submitted,
-                    worker_output_queue_received,
-                    worker_output_queue_max_depth,
-                    worker_output_bytes_submitted,
-                    worker_output_bytes_written,
-                    worker_writer_bytes_per_second_estimate,
-                    worker_writer_last_progress_micros,
-                    worker_writer_next_expected_batch_id,
-                    worker_output_flow_controller,
-                    worker_compute_workers_alive,
-                    worker_output_queue_capacity,
-                    worker_writer_runtime_config,
-                    worker_pipeline_start,
-                    worker_lifecycle,
-                )
-            }),
-        ));
+        compute_handles.push(thread::spawn(move || {
+            direct_compute_thread(
+                worker_id,
+                worker_receiver,
+                worker_sender,
+                worker_quality,
+                worker_input_queue_depth,
+                worker_output_queue_submitted,
+                worker_output_queue_received,
+                worker_output_queue_max_depth,
+                worker_output_bytes_submitted,
+                worker_output_bytes_written,
+                worker_writer_bytes_per_second_estimate,
+                worker_writer_last_progress_micros,
+                worker_writer_next_expected_batch_id,
+                worker_output_flow_controller,
+                worker_output_queue_capacity,
+                worker_writer_runtime_config,
+                worker_pipeline_start,
+                worker_lifecycle,
+            )
+        }));
     }
+    drop(output_batch_sender);
     let writer_output_queue_received = Arc::clone(&output_queue_received);
     let writer_output_bytes_submitted = Arc::clone(&output_bytes_submitted);
     let writer_output_bytes_written = Arc::clone(&output_bytes_written);
@@ -1228,12 +1195,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let writer_next_expected_batch_id_for_thread = Arc::clone(&writer_next_expected_batch_id);
     let writer_output_flow_controller = Arc::clone(&output_flow_controller);
     let writer_lifecycle = Arc::clone(&lifecycle);
-    let writer_alive_for_thread = Arc::clone(&writer_alive);
     let output_path_for_writer = cli.output.clone();
     let writer_handle = thread::spawn(move || {
-        let result = direct_writer_thread(
+        direct_writer_thread(
             output_batch_receiver,
-            output_writer,
+            output,
             output_path_for_writer,
             writer_output_queue_received,
             writer_output_bytes_submitted,
@@ -1245,24 +1211,8 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_runtime_config,
             pipeline_start,
             writer_lifecycle,
-        );
-        writer_alive_for_thread.store(false, Ordering::SeqCst);
-        result
+        )
     });
-
-    let watchdog_handle = spawn_direct_stall_watchdog(
-        cli,
-        DirectWatchdogState {
-            forward_reader_done: Arc::clone(&forward_reader_done),
-            reverse_reader_done: Arc::clone(&reverse_reader_done),
-            compute_workers_alive: Arc::clone(&compute_workers_alive),
-            writer_alive: Arc::clone(&writer_alive),
-            shutdown: Arc::clone(&watchdog_shutdown),
-            input_queue_depth: Arc::clone(&input_queue_depth),
-            reader_queue_depth: Arc::clone(&reader_queue_depth),
-            output_flow_controller: Arc::clone(&output_flow_controller),
-        },
-    );
 
     stage_log(
         cli,
@@ -1277,9 +1227,9 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 .unwrap_or_else(|| "htslib_default".to_string()),
             thread_resolution.htslib_pool_enabled,
             direct_htslib_pool_mode_name(&cli.direct_htslib_pool_mode),
-            forward_bgzf_threads,
-            reverse_bgzf_threads,
-            output_bgzf_threads,
+            split_workers.forward,
+            split_workers.reverse,
+            split_workers.output,
             writer_runtime_config.drain_min_interval_micros,
             writer_runtime_config.drain_min_base_bytes,
             writer_runtime_config.drain_bytes_per_probe_second,
@@ -1297,7 +1247,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
 
     let read_match_start = Instant::now();
     mark_elapsed_once(&lifecycle.readers_started_micros, pipeline_start);
-    stage_log_always("STAGE direct_readers_started");
     let mut forward_reader_stats = ReaderDecodeStats::default();
     let mut reverse_reader_stats = ReaderDecodeStats::default();
     let mut pair_match_assembly_seconds = 0.0f64;
@@ -1315,21 +1264,20 @@ fn run_direct(cli: &Cli) -> Result<()> {
 
     match cli.direct_reader_mode {
         DirectReaderMode::Serial => {
-            stage_log_always("STAGE direct_join_wait thread=synchronizer");
             let mut forward_reader = bam::Reader::from_path(&cli.forward).with_context(|| {
                 format!("failed to open forward input {}", cli.forward.display())
             })?;
             let mut reverse_reader = bam::Reader::from_path(&cli.reverse).with_context(|| {
                 format!("failed to open reverse input {}", cli.reverse.display())
             })?;
-            if forward_bgzf_threads > 0 {
+            if split_workers.forward > 0 {
                 forward_reader
-                    .set_threads(forward_bgzf_threads)
+                    .set_threads(split_workers.forward)
                     .context("failed to set forward reader threads")?;
             }
-            if reverse_bgzf_threads > 0 {
+            if split_workers.reverse > 0 {
                 reverse_reader
-                    .set_threads(reverse_bgzf_threads)
+                    .set_threads(split_workers.reverse)
                     .context("failed to set reverse reader threads")?;
             }
             let mut forward_pending = None;
@@ -1372,19 +1320,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     break;
                 }
             }
-            forward_reader_done.store(true, Ordering::SeqCst);
-            reverse_reader_done.store(true, Ordering::SeqCst);
-            stage_log_always(format!(
-                "STAGE direct_reader_eof side=forward groups={} records={}",
-                forward_reader_stats.groups_decoded, forward_reader_stats.records_decoded
-            ));
-            stage_log_always("STAGE direct_reader_finished side=forward");
-            stage_log_always(format!(
-                "STAGE direct_reader_eof side=reverse groups={} records={}",
-                reverse_reader_stats.groups_decoded, reverse_reader_stats.records_decoded
-            ));
-            stage_log_always("STAGE direct_reader_finished side=reverse");
-            stage_log_always("STAGE direct_join_done thread=synchronizer");
         }
         DirectReaderMode::ParallelChunked => {
             reader_threads_spawned = 2;
@@ -1400,12 +1335,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
             let forward_path = cli.forward.clone();
             let reverse_path = cli.reverse.clone();
             let chunk_groups = queue_policy.reader_chunk_groups;
-            let forward_threads = forward_bgzf_threads;
-            let reverse_threads = reverse_bgzf_threads;
+            let forward_threads = split_workers.forward.max(1);
+            let reverse_threads = split_workers.reverse.max(1);
             let forward_chunk_depth_reader = Arc::clone(&forward_chunk_depth);
             let forward_chunk_max_depth_reader = Arc::clone(&forward_chunk_max_depth);
-            let forward_reader_done_for_thread = Arc::clone(&forward_reader_done);
-            let reader_queue_depth_forward = Arc::clone(&reader_queue_depth);
             let forward_handle = thread::spawn(move || {
                 read_group_chunks_producer(
                     forward_path,
@@ -1416,14 +1349,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     queue_policy.reader_queue_capacity,
                     forward_chunk_depth_reader,
                     forward_chunk_max_depth_reader,
-                    reader_queue_depth_forward,
-                    forward_reader_done_for_thread,
                 )
             });
             let reverse_chunk_depth_reader = Arc::clone(&reverse_chunk_depth);
             let reverse_chunk_max_depth_reader = Arc::clone(&reverse_chunk_max_depth);
-            let reverse_reader_done_for_thread = Arc::clone(&reverse_reader_done);
-            let reader_queue_depth_reverse = Arc::clone(&reader_queue_depth);
             let reverse_handle = thread::spawn(move || {
                 read_group_chunks_producer(
                     reverse_path,
@@ -1434,17 +1363,13 @@ fn run_direct(cli: &Cli) -> Result<()> {
                     queue_policy.reader_queue_capacity,
                     reverse_chunk_depth_reader,
                     reverse_chunk_max_depth_reader,
-                    reader_queue_depth_reverse,
-                    reverse_reader_done_for_thread,
                 )
             });
-            stage_log_always("STAGE direct_join_wait thread=synchronizer");
             sync_parallel_reader_groups(
                 &forward_rx,
                 &reverse_rx,
                 &forward_chunk_depth,
                 &reverse_chunk_depth,
-                &reader_queue_depth,
                 &mut active_batch,
                 &input_batch_sender,
                 &input_queue_depth,
@@ -1464,17 +1389,12 @@ fn run_direct(cli: &Cli) -> Result<()> {
                 pipeline_start,
                 &lifecycle,
             )?;
-            stage_log_always("STAGE direct_join_done thread=synchronizer");
-            stage_log_always("STAGE direct_join_wait thread=forward_reader");
             forward_reader_stats = forward_handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("forward reader thread panicked"))??;
-            stage_log_always("STAGE direct_join_done thread=forward_reader");
-            stage_log_always("STAGE direct_join_wait thread=reverse_reader");
             reverse_reader_stats = reverse_handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("reverse reader thread panicked"))??;
-            stage_log_always("STAGE direct_join_done thread=reverse_reader");
             reader_chunk_queue_stats.max_depth = forward_chunk_max_depth
                 .load(Ordering::Relaxed)
                 .max(reverse_chunk_max_depth.load(Ordering::Relaxed));
@@ -1492,21 +1412,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
         forward_reader_stats.wall_seconds = forward_reader_stats.decode_seconds;
         reverse_reader_stats.wall_seconds = reverse_reader_stats.decode_seconds;
     }
-
-    stage_log_always(format!(
-        "STAGE direct_readers_finished forward_groups={} reverse_groups={}",
-        forward_reader_stats.groups_decoded, reverse_reader_stats.groups_decoded
-    ));
-    stage_log(
-        cli,
-        format!(
-            "readers finished: forward_records_decoded={} reverse_records_decoded={} groups_seen={} reader_threads_spawned={}",
-            forward_reader_stats.records_decoded,
-            reverse_reader_stats.records_decoded,
-            groups_seen,
-            reader_threads_spawned
-        ),
-    );
 
     let read_match_seconds = read_match_start.elapsed().as_secs_f64();
     let read_decode_seconds =
@@ -1550,17 +1455,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
         ..Default::default()
     };
     let mut per_worker_stats = Vec::with_capacity(thread_resolution.compute_workers);
-    stage_log_always("STAGE direct_threads_join_start");
-    for (worker_id, handle) in compute_handles {
-        stage_log_always(format!(
-            "STAGE direct_join_wait thread=compute_worker_{worker_id}"
-        ));
+    for handle in compute_handles {
         let worker_stats = handle
             .join()
             .map_err(|_| anyhow::anyhow!("direct compute thread panicked"))??;
-        stage_log_always(format!(
-            "STAGE direct_join_done thread=compute_worker_{worker_id}"
-        ));
         per_worker_stats.push(worker_stats.clone());
         compute_stats.compute_batches_processed += worker_stats.compute_batches_processed;
         compute_stats.compute_records_selected += worker_stats.compute_records_selected;
@@ -1593,6 +1491,7 @@ fn run_direct(cli: &Cli) -> Result<()> {
             .max(worker_stats.compute_filter_wall_seconds);
     }
     mark_elapsed_once(&lifecycle.compute_done_micros, pipeline_start);
+    mark_elapsed_once(&lifecycle.output_senders_dropped_micros, pipeline_start);
     per_worker_stats.sort_by_key(|entry| entry.worker_id);
     compute_stats.per_worker_batches_processed = per_worker_stats
         .iter()
@@ -1632,34 +1531,10 @@ fn run_direct(cli: &Cli) -> Result<()> {
         percentile_seconds(&mut all_batch_filter_samples_seconds, 99.0);
     compute_stats.compute_to_writer_queue_max_depth =
         output_queue_max_depth.load(Ordering::Relaxed);
-    stage_log_always(format!(
-        "STAGE direct_compute_finished workers={} batches={} records={}",
-        compute_stats.compute_workers,
-        compute_stats.compute_batches_processed,
-        compute_stats.compute_records_selected
-    ));
-    stage_log(
-        cli,
-        format!(
-            "compute workers finished: workers={} batches_processed={} records_selected={}",
-            compute_stats.compute_workers,
-            compute_stats.compute_batches_processed,
-            compute_stats.compute_records_selected
-        ),
-    );
-    output_batch_sender
-        .send(WriterMessage::Done {
-            total_batches: compute_stats.compute_batches_processed,
-        })
-        .context("failed to send writer completion message")?;
-    drop(output_batch_sender);
-    mark_elapsed_once(&lifecycle.output_senders_dropped_micros, pipeline_start);
-    stage_log_always("STAGE direct_channels_closed");
     let producer_done_seconds = pipeline_start.elapsed().as_secs_f64();
     let writer_wait_start = Instant::now();
     let mut writer_drain_diagnostics = WriterDrainDiagnostics::default();
     let mut last_sample_instant = Instant::now();
-    stage_log_always("STAGE direct_join_wait thread=writer");
     while !writer_handle.is_finished() {
         let now = Instant::now();
         let delta = now.duration_since(last_sample_instant).as_secs_f64();
@@ -1701,16 +1576,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("direct writer thread panicked"))??;
     mark_elapsed_once(&lifecycle.writer_join_done_micros, pipeline_start);
-    stage_log_always("STAGE direct_join_done thread=writer");
-    stage_log(
-        cli,
-        format!(
-            "writer finished: batches_processed={} records_written={} output_bytes_after_close={}",
-            writer_stats.batches_processed,
-            writer_stats.records_written,
-            writer_stats.output_bytes_after_close
-        ),
-    );
     let writer_drain_seconds = writer_wait_start.elapsed().as_secs_f64();
     let output_flow_snapshot = output_flow_controller.snapshot();
     stage_log(
@@ -1738,37 +1603,12 @@ fn run_direct(cli: &Cli) -> Result<()> {
         ),
     );
     writer_drain_diagnostics.join_wait_seconds = writer_drain_seconds;
-    let output_pool_drop_start = Instant::now();
-    drop(output_bgzf_pool);
-    let output_pool_drop_seconds = output_pool_drop_start.elapsed().as_secs_f64();
     let shared_pool_drop_start = Instant::now();
     drop(shared_bgzf_pool);
     let shared_pool_drop_seconds = shared_pool_drop_start.elapsed().as_secs_f64();
-    stage_log(
-        cli,
-        format!(
-            "output flushed: output={} output_mb={:.3} hts_close_seconds={:.6}",
-            cli.output.display(),
-            size_mb(&cli.output)?,
-            writer_stats.hts_close_seconds
-        ),
-    );
-    stage_log(
-        cli,
-        format!(
-            "all threads joined: reader_threads_spawned={} compute_workers={} writer=joined",
-            reader_threads_spawned, thread_resolution.compute_workers
-        ),
-    );
-    watchdog_shutdown.store(true, Ordering::SeqCst);
-    if let Some(watchdog_handle) = watchdog_handle {
-        stage_log_always("STAGE direct_join_wait thread=progress_monitor");
-        watchdog_handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("direct stall watchdog thread panicked"))?;
-        stage_log_always("STAGE direct_join_done thread=progress_monitor");
-    }
-    stage_log_always("STAGE direct_threads_join_finished");
+    let output_pool_drop_start = Instant::now();
+    drop(output_bgzf_pool);
+    let output_pool_drop_seconds = output_pool_drop_start.elapsed().as_secs_f64();
     let stats = writer_stats.pair_stats;
     let writer_loop_seconds = writer_stats.writer_loop_seconds;
     let writer_recv_wait_seconds = writer_stats.writer_recv_wait_seconds;
@@ -2447,19 +2287,6 @@ fn run_direct(cli: &Cli) -> Result<()> {
             writer_tail_seconds_per_million_groups
         ),
     );
-    stage_log(
-        cli,
-        format!(
-            "program exiting: output={} records_written={} end_to_end_seconds={:.6}",
-            cli.output.display(),
-            writer_stats.records_written,
-            end_to_end_seconds
-        ),
-    );
-    stage_log_always(format!(
-        "STAGE direct_done exit_code=0 seconds={:.6}",
-        end_to_end_seconds
-    ));
     Ok(())
 }
 
@@ -2499,11 +2326,10 @@ fn flush_direct_batch(
         groups: std::mem::replace(active_batch, Vec::with_capacity(direct_batch_size)),
     };
     *next_batch_id += 1;
-    let depth = increment_depth(queue_depth);
-    if let Err(error) = batch_sender.send(batch) {
-        decrement_depth(queue_depth);
-        return Err(error).context("failed to send direct batch to writer thread");
-    }
+    batch_sender
+        .send(batch)
+        .context("failed to send direct batch to writer thread")?;
+    let depth = queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
     lifecycle.last_input_batch_submitted_micros.store(
         pipeline_start
             .elapsed()
@@ -2613,16 +2439,12 @@ fn read_group_chunks_producer(
     reader_chunk_queue_capacity: usize,
     chunk_queue_depth: Arc<AtomicUsize>,
     chunk_queue_max_depth: Arc<AtomicUsize>,
-    aggregate_chunk_queue_depth: Arc<AtomicUsize>,
-    reader_done: Arc<AtomicBool>,
 ) -> Result<ReaderDecodeStats> {
     let mut reader = bam::Reader::from_path(&input_path)
         .with_context(|| format!("failed to open {label} input {}", input_path.display()))?;
-    if reader_threads > 0 {
-        reader
-            .set_threads(reader_threads)
-            .with_context(|| format!("failed to set {label} reader threads"))?;
-    }
+    reader
+        .set_threads(reader_threads)
+        .with_context(|| format!("failed to set {label} reader threads"))?;
     let wall_start = Instant::now();
     let mut stats = ReaderDecodeStats::default();
     let mut pending = None;
@@ -2650,24 +2472,15 @@ fn read_group_chunks_producer(
             }
         }
         if groups.is_empty() {
-            stage_log_always(format!(
-                "STAGE direct_reader_eof side={} groups={} records={}",
-                label, stats.groups_decoded, stats.records_decoded
-            ));
             if chunk_queue_depth.load(Ordering::Relaxed) >= reader_chunk_queue_capacity {
                 stats.queue_full_events += 1;
             }
             let send_start = Instant::now();
-            let depth = increment_depth(&chunk_queue_depth);
-            increment_depth(&aggregate_chunk_queue_depth);
-            if let Err(error) = sender.send(Ok(None)) {
-                decrement_depth(&chunk_queue_depth);
-                decrement_depth(&aggregate_chunk_queue_depth);
-                return Err(error)
-                    .with_context(|| format!("failed to send {label} EOF from producer"));
-            }
-            reader_done.store(true, Ordering::SeqCst);
+            sender
+                .send(Ok(None))
+                .with_context(|| format!("failed to send {label} EOF from producer"))?;
             stats.send_wait_seconds += send_start.elapsed().as_secs_f64();
+            let depth = chunk_queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
             stats.queue_occupancy_sum += depth as u64;
             stats.queue_occupancy_samples += 1;
             loop {
@@ -2709,19 +2522,15 @@ fn read_group_chunks_producer(
             }
         }
         let send_start = Instant::now();
-        let depth = increment_depth(&chunk_queue_depth);
-        increment_depth(&aggregate_chunk_queue_depth);
-        if let Err(error) = sender.send(Ok(Some(ReaderChunk { groups }))) {
-            decrement_depth(&chunk_queue_depth);
-            decrement_depth(&aggregate_chunk_queue_depth);
-            return Err(error)
-                .with_context(|| format!("failed to send {label} chunk from producer"));
-        }
+        sender
+            .send(Ok(Some(ReaderChunk { groups })))
+            .with_context(|| format!("failed to send {label} chunk from producer"))?;
         stats.send_wait_seconds += send_start.elapsed().as_secs_f64();
         last_chunk_send_end = Some(Instant::now());
         stats.chunks_sent += 1;
         stats.total_chunk_groups += group_count as u64;
         stats.max_chunk_groups = stats.max_chunk_groups.max(group_count);
+        let depth = chunk_queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
         stats.queue_occupancy_sum += depth as u64;
         stats.queue_occupancy_samples += 1;
         loop {
@@ -2738,7 +2547,6 @@ fn read_group_chunks_producer(
         }
     }
     stats.wall_seconds = wall_start.elapsed().as_secs_f64();
-    stage_log_always(format!("STAGE direct_reader_finished side={label}"));
     Ok(stats)
 }
 
@@ -2747,7 +2555,6 @@ fn drain_reader_try_recv(
     queue: &mut VecDeque<DirectRecordGroup>,
     done: &mut bool,
     chunk_depth: &Arc<AtomicUsize>,
-    aggregate_chunk_depth: &Arc<AtomicUsize>,
     prefetch_groups: usize,
     try_recv_hits: &mut u64,
     label: &'static str,
@@ -2759,8 +2566,7 @@ fn drain_reader_try_recv(
         match rx.try_recv() {
             Ok(next_chunk) => {
                 *try_recv_hits += 1;
-                decrement_depth(chunk_depth);
-                decrement_depth(aggregate_chunk_depth);
+                chunk_depth.fetch_sub(1, Ordering::Relaxed);
                 match next_chunk? {
                     Some(chunk) => {
                         for group in chunk.groups {
@@ -2783,56 +2589,11 @@ fn drain_reader_try_recv(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enqueue_synced_direct_pair(
-    f_group: DirectRecordGroup,
-    r_group: DirectRecordGroup,
-    active_batch: &mut Vec<(DirectRecordGroup, DirectRecordGroup)>,
-    batch_sender: &SyncSender<DirectInputBatch>,
-    queue_depth: &Arc<AtomicUsize>,
-    max_queue_depth: &Arc<AtomicUsize>,
-    batch_enqueue_wait_seconds: &mut f64,
-    direct_batch_size: usize,
-    groups_seen: &mut u64,
-    matcher_output_queue_capacity: usize,
-    output_queue_full_events: &mut u64,
-    sync_diagnostics: &mut SyncDiagnostics,
-    next_batch_id: &mut u64,
-    input_flow_control_wait_seconds: &mut f64,
-    output_flow_controller: &Arc<OutputFlowController>,
-    pipeline_start: Instant,
-    lifecycle: &Arc<PipelineLifecycleMarkers>,
-) -> Result<()> {
-    active_batch.push((f_group, r_group));
-    *groups_seen += 1;
-    if active_batch.len() >= direct_batch_size {
-        let enqueue_start = Instant::now();
-        flush_direct_batch(
-            active_batch,
-            batch_sender,
-            queue_depth,
-            max_queue_depth,
-            batch_enqueue_wait_seconds,
-            direct_batch_size,
-            matcher_output_queue_capacity,
-            output_queue_full_events,
-            next_batch_id,
-            input_flow_control_wait_seconds,
-            output_flow_controller,
-            pipeline_start,
-            lifecycle,
-        )?;
-        sync_diagnostics.output_enqueue_seconds += enqueue_start.elapsed().as_secs_f64();
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn sync_parallel_reader_groups(
     forward_rx: &Receiver<Result<Option<ReaderChunk>>>,
     reverse_rx: &Receiver<Result<Option<ReaderChunk>>>,
     forward_chunk_depth: &Arc<AtomicUsize>,
     reverse_chunk_depth: &Arc<AtomicUsize>,
-    aggregate_chunk_depth: &Arc<AtomicUsize>,
     active_batch: &mut Vec<(DirectRecordGroup, DirectRecordGroup)>,
     batch_sender: &SyncSender<DirectInputBatch>,
     queue_depth: &Arc<AtomicUsize>,
@@ -2924,7 +2685,6 @@ fn sync_parallel_reader_groups(
             &mut forward_queue,
             &mut forward_done,
             forward_chunk_depth,
-            aggregate_chunk_depth,
             adaptive_prefetch_groups,
             &mut sync_diagnostics.forward_try_recv_hits,
             "forward",
@@ -2934,7 +2694,6 @@ fn sync_parallel_reader_groups(
             &mut reverse_queue,
             &mut reverse_done,
             reverse_chunk_depth,
-            aggregate_chunk_depth,
             adaptive_prefetch_groups,
             &mut sync_diagnostics.reverse_try_recv_hits,
             "reverse",
@@ -2975,8 +2734,7 @@ fn sync_parallel_reader_groups(
                 .max_consecutive_waits_forward
                 .max(consecutive_waits_forward);
             if let Some(next_forward_chunk) = next_forward_chunk {
-                decrement_depth(forward_chunk_depth);
-                decrement_depth(aggregate_chunk_depth);
+                forward_chunk_depth.fetch_sub(1, Ordering::Relaxed);
                 match next_forward_chunk? {
                     Some(chunk) => {
                         for group in chunk.groups {
@@ -2991,7 +2749,6 @@ fn sync_parallel_reader_groups(
                     &mut reverse_queue,
                     &mut reverse_done,
                     reverse_chunk_depth,
-                    aggregate_chunk_depth,
                     adaptive_prefetch_groups,
                     &mut sync_diagnostics.reverse_try_recv_hits,
                     "reverse",
@@ -3028,8 +2785,7 @@ fn sync_parallel_reader_groups(
                 .max_consecutive_waits_reverse
                 .max(consecutive_waits_reverse);
             if let Some(next_reverse_chunk) = next_reverse_chunk {
-                decrement_depth(reverse_chunk_depth);
-                decrement_depth(aggregate_chunk_depth);
+                reverse_chunk_depth.fetch_sub(1, Ordering::Relaxed);
                 match next_reverse_chunk? {
                     Some(chunk) => {
                         for group in chunk.groups {
@@ -3044,82 +2800,10 @@ fn sync_parallel_reader_groups(
                     &mut forward_queue,
                     &mut forward_done,
                     forward_chunk_depth,
-                    aggregate_chunk_depth,
                     adaptive_prefetch_groups,
                     &mut sync_diagnostics.forward_try_recv_hits,
                     "forward",
                 )?;
-            }
-        }
-
-        if forward_done && forward_queue.is_empty() && !reverse_queue.is_empty() {
-            while let Some(r_group) = reverse_queue.pop_front() {
-                let key = r_group.qname().to_vec();
-                if let Some(f_group) = pending_forward.remove(&key) {
-                    let match_start = Instant::now();
-                    enqueue_synced_direct_pair(
-                        f_group,
-                        r_group,
-                        active_batch,
-                        batch_sender,
-                        queue_depth,
-                        max_queue_depth,
-                        batch_enqueue_wait_seconds,
-                        direct_batch_size,
-                        groups_seen,
-                        matcher_output_queue_capacity,
-                        output_queue_full_events,
-                        sync_diagnostics,
-                        next_batch_id,
-                        input_flow_control_wait_seconds,
-                        output_flow_controller,
-                        pipeline_start,
-                        lifecycle,
-                    )?;
-                    let elapsed = match_start.elapsed().as_secs_f64();
-                    *pair_match_assembly_seconds += elapsed;
-                    sync_diagnostics.match_loop_seconds += elapsed;
-                } else {
-                    bail!(
-                        "direct input BAMs contained a different number of query-name groups; unmatched reverse QNAME after forward EOF: {}",
-                        String::from_utf8_lossy(&key)
-                    );
-                }
-            }
-        }
-        if reverse_done && reverse_queue.is_empty() && !forward_queue.is_empty() {
-            while let Some(f_group) = forward_queue.pop_front() {
-                let key = f_group.qname().to_vec();
-                if let Some(r_group) = pending_reverse.remove(&key) {
-                    let match_start = Instant::now();
-                    enqueue_synced_direct_pair(
-                        f_group,
-                        r_group,
-                        active_batch,
-                        batch_sender,
-                        queue_depth,
-                        max_queue_depth,
-                        batch_enqueue_wait_seconds,
-                        direct_batch_size,
-                        groups_seen,
-                        matcher_output_queue_capacity,
-                        output_queue_full_events,
-                        sync_diagnostics,
-                        next_batch_id,
-                        input_flow_control_wait_seconds,
-                        output_flow_controller,
-                        pipeline_start,
-                        lifecycle,
-                    )?;
-                    let elapsed = match_start.elapsed().as_secs_f64();
-                    *pair_match_assembly_seconds += elapsed;
-                    sync_diagnostics.match_loop_seconds += elapsed;
-                } else {
-                    bail!(
-                        "direct input BAMs contained a different number of query-name groups; unmatched forward QNAME after reverse EOF: {}",
-                        String::from_utf8_lossy(&key)
-                    );
-                }
             }
         }
 
@@ -3272,24 +2956,24 @@ fn sync_parallel_reader_groups(
 fn direct_compute_thread(
     worker_id: usize,
     batch_receiver: Arc<Mutex<Receiver<DirectInputBatch>>>,
-    output_sender: SyncSender<WriterMessage>,
+    output_sender: SyncSender<DirectOutputBatch>,
     quality: u8,
     input_queue_depth: Arc<AtomicUsize>,
     output_queue_submitted: Arc<AtomicU64>,
     output_queue_received: Arc<AtomicU64>,
     output_queue_max_depth: Arc<AtomicUsize>,
     output_bytes_submitted: Arc<AtomicU64>,
-    _output_bytes_written: Arc<AtomicU64>,
-    _writer_bytes_per_second_estimate: Arc<AtomicU64>,
-    _writer_last_progress_micros: Arc<AtomicU64>,
-    _writer_next_expected_batch_id: Arc<AtomicU64>,
+    output_bytes_written: Arc<AtomicU64>,
+    writer_bytes_per_second_estimate: Arc<AtomicU64>,
+    writer_last_progress_micros: Arc<AtomicU64>,
+    writer_next_expected_batch_id: Arc<AtomicU64>,
     flow_controller: Arc<OutputFlowController>,
-    compute_workers_alive: Arc<AtomicUsize>,
     output_queue_capacity: usize,
-    _runtime_config: DirectWriterRuntimeConfig,
+    runtime_config: DirectWriterRuntimeConfig,
     pipeline_start: Instant,
     lifecycle: Arc<PipelineLifecycleMarkers>,
 ) -> Result<DirectComputeWorkerStats> {
+    const COMPUTE_AHEAD_WINDOW_BATCHES_PER_WORKER: u64 = 2;
     let worker_start = Instant::now();
     let mut compute_input_wait_wall_seconds = 0.0f64;
     let mut compute_output_send_wait_wall_seconds = 0.0f64;
@@ -3317,7 +3001,7 @@ fn direct_compute_thread(
                 let input_wait_seconds = recv_wait_start.elapsed().as_secs_f64();
                 stats.compute_input_wait_thread_seconds_total += input_wait_seconds;
                 compute_input_wait_wall_seconds += input_wait_seconds;
-                decrement_depth(&input_queue_depth);
+                input_queue_depth.fetch_sub(1, Ordering::Relaxed);
                 stats.compute_batches_processed += 1;
                 let output_batch = process_direct_batch(batch, quality);
                 let output_batch_id = output_batch.batch_id;
@@ -3349,10 +3033,7 @@ fn direct_compute_thread(
                     stats.compute_output_queue_full_events += 1;
                 }
                 let send_wait_start = Instant::now();
-                if output_sender
-                    .send(WriterMessage::Batch(output_batch))
-                    .is_err()
-                {
+                if output_sender.send(output_batch).is_err() {
                     flow_controller.on_compute_done();
                     break;
                 }
@@ -3387,7 +3068,6 @@ fn direct_compute_thread(
             Err(_) => break,
         }
     }
-    compute_workers_alive.fetch_sub(1, Ordering::SeqCst);
     stats.compute_filter_wall_seconds = worker_start.elapsed().as_secs_f64();
     stats.compute_input_wait_wall_seconds = compute_input_wait_wall_seconds;
     stats.compute_output_send_wait_wall_seconds = compute_output_send_wait_wall_seconds;
@@ -3402,7 +3082,6 @@ fn estimate_output_batch_bytes(batch: &DirectOutputBatch) -> u64 {
         .sum()
 }
 
-#[allow(dead_code)]
 fn should_throttle_compute_submission(
     output_batch_id: u64,
     writer_window_batches: u64,
@@ -3870,79 +3549,8 @@ impl OutputFlowController {
     }
 }
 
-struct DirectWatchdogState {
-    forward_reader_done: Arc<AtomicBool>,
-    reverse_reader_done: Arc<AtomicBool>,
-    compute_workers_alive: Arc<AtomicUsize>,
-    writer_alive: Arc<AtomicBool>,
-    shutdown: Arc<AtomicBool>,
-    input_queue_depth: Arc<AtomicUsize>,
-    reader_queue_depth: Arc<AtomicUsize>,
-    output_flow_controller: Arc<OutputFlowController>,
-}
-
-fn spawn_direct_stall_watchdog(
-    cli: &Cli,
-    state: DirectWatchdogState,
-) -> Option<thread::JoinHandle<()>> {
-    let timeout_seconds = cli.stall_timeout_seconds?;
-    if timeout_seconds == 0 {
-        return None;
-    }
-    let abort_on_stall = cli.abort_on_stall;
-    Some(thread::spawn(move || {
-        let timeout = Duration::from_secs(timeout_seconds);
-        let sleep_interval = Duration::from_secs(1).min(timeout);
-        let mut last_progress = Instant::now();
-        let mut last_observed = (0u64, 0u64, 0u64, 0u64, 0usize, 0usize);
-        loop {
-            thread::sleep(sleep_interval);
-            if state.shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-            let snapshot = state.output_flow_controller.snapshot();
-            let input_depth = state.input_queue_depth.load(Ordering::Relaxed);
-            let reader_depth = state.reader_queue_depth.load(Ordering::Relaxed);
-            let observed = (
-                snapshot.submitted_batches,
-                snapshot.received_batches,
-                snapshot.written_batches,
-                snapshot.written_output_bytes_estimate,
-                input_depth,
-                reader_depth,
-            );
-            if observed != last_observed {
-                last_observed = observed;
-                last_progress = Instant::now();
-                continue;
-            }
-            let stalled_for = last_progress.elapsed();
-            if stalled_for < timeout {
-                continue;
-            }
-            stage_log_always(format!(
-                "STAGE direct_stall_warning seconds_since_progress={} reader_forward_done={} reader_reverse_done={} compute_workers_alive={} writer_alive={} next_expected_batch_id={} highest_submitted_batch_id={} pending_writer_batches={} reader_queue_depth={} output_queue_depth={}",
-                stalled_for.as_secs(),
-                state.forward_reader_done.load(Ordering::SeqCst),
-                state.reverse_reader_done.load(Ordering::SeqCst),
-                state.compute_workers_alive.load(Ordering::SeqCst),
-                state.writer_alive.load(Ordering::SeqCst),
-                snapshot.next_expected_batch_id,
-                snapshot.submitted_batches.saturating_sub(1),
-                snapshot.ordered_pending_batches,
-                reader_depth,
-                snapshot.compute_to_writer_queue_depth
-            ));
-            if abort_on_stall {
-                std::process::abort();
-            }
-            last_progress = Instant::now();
-        }
-    }))
-}
-
 fn direct_writer_thread(
-    batch_receiver: Receiver<WriterMessage>,
+    batch_receiver: Receiver<DirectOutputBatch>,
     mut output: Writer,
     output_path: PathBuf,
     output_queue_received: Arc<AtomicU64>,
@@ -3958,90 +3566,54 @@ fn direct_writer_thread(
 ) -> Result<DirectWorkerStats> {
     mark_elapsed_once(&lifecycle.writer_thread_started_micros, pipeline_start);
     let writer_loop_start = Instant::now();
-    stage_log_always("STAGE direct_writer_started");
     writer_last_progress_micros.store(0, Ordering::Relaxed);
     let mut worker_stats = DirectWorkerStats::default();
     let mut next_batch_id = 0u64;
     let mut pending: BTreeMap<u64, DirectOutputBatch> = BTreeMap::new();
     let mut waiting_for_batch_counts: HashMap<u64, u64> = HashMap::new();
     let mut drain_controller = OutputDrainController::new(runtime_config.drain_min_base_bytes);
-    let mut done_total_batches: Option<u64> = None;
     loop {
         let recv_wait_start = Instant::now();
-        let message = match batch_receiver.recv() {
-            Ok(message) => message,
-            Err(_) => {
-                if let Some(total_batches) = done_total_batches {
-                    if next_batch_id == total_batches {
-                        break;
-                    }
-                    bail!(
-                        "ordered writer channel closed after Done but before all batches were written: next_expected_batch_id={} total_batches={} pending_batches={}",
-                        next_batch_id,
-                        total_batches,
-                        pending.len()
-                    );
-                }
-                bail!(
-                    "ordered writer channel closed before Done: next_expected_batch_id={} pending_batches={}",
-                    next_batch_id,
-                    pending.len()
-                );
-            }
+        let output_batch = match batch_receiver.recv() {
+            Ok(batch) => batch,
+            Err(_) => break,
         };
+        mark_elapsed_once(
+            &lifecycle.first_writer_batch_received_micros,
+            pipeline_start,
+        );
+        lifecycle.writer_last_batch_received_micros.store(
+            pipeline_start
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        let output_batch_bytes_estimate = estimate_output_batch_bytes(&output_batch);
+        flow_controller.on_writer_received(output_batch.batch_id);
+        output_queue_received.fetch_add(1, Ordering::Relaxed);
         worker_stats.writer_recv_wait_seconds += recv_wait_start.elapsed().as_secs_f64();
-        let maybe_output_batch = match message {
-            WriterMessage::Batch(batch) => Some(batch),
-            WriterMessage::Done { total_batches } => {
-                if total_batches < next_batch_id {
-                    bail!(
-                        "ordered writer received invalid Done total_batches={} below next_expected_batch_id={}",
-                        total_batches,
-                        next_batch_id
-                    );
-                }
-                done_total_batches = Some(total_batches);
-                None
-            }
-            WriterMessage::Error(error) => bail!("direct compute reported writer error: {error}"),
-        };
-        if let Some(output_batch) = maybe_output_batch {
-            mark_elapsed_once(
-                &lifecycle.first_writer_batch_received_micros,
-                pipeline_start,
-            );
-            lifecycle.writer_last_batch_received_micros.store(
-                pipeline_start
-                    .elapsed()
-                    .as_micros()
-                    .min(u128::from(u64::MAX)) as u64,
-                Ordering::Relaxed,
-            );
-            let output_batch_bytes_estimate = estimate_output_batch_bytes(&output_batch);
-            flow_controller.on_writer_received(output_batch.batch_id);
-            output_queue_received.fetch_add(1, Ordering::Relaxed);
-            worker_stats.ordered_writer_largest_received_batch_id = worker_stats
-                .ordered_writer_largest_received_batch_id
-                .max(output_batch.batch_id);
-            if output_batch.batch_id > next_batch_id {
-                worker_stats.ordered_writer_missing_batch_wait_events += 1;
-                worker_stats.ordered_writer_max_gap = worker_stats
-                    .ordered_writer_max_gap
-                    .max(output_batch.batch_id - next_batch_id);
-                *waiting_for_batch_counts.entry(next_batch_id).or_insert(0) += 1;
-            }
-            worker_stats.max_completed_batch_gap_at_writer = worker_stats
-                .max_completed_batch_gap_at_writer
-                .max(output_batch.batch_id.saturating_sub(next_batch_id));
-            pending.insert(output_batch.batch_id, output_batch);
-            flow_controller.on_writer_ordered_pending(output_batch_bytes_estimate);
-            worker_stats.ordered_writer_pending_batches_max = worker_stats
-                .ordered_writer_pending_batches_max
-                .max(pending.len());
-            worker_stats.ordered_writer_pending_map_max_size = worker_stats
-                .ordered_writer_pending_map_max_size
-                .max(pending.len());
+        worker_stats.ordered_writer_largest_received_batch_id = worker_stats
+            .ordered_writer_largest_received_batch_id
+            .max(output_batch.batch_id);
+        if output_batch.batch_id > next_batch_id {
+            worker_stats.ordered_writer_missing_batch_wait_events += 1;
+            worker_stats.ordered_writer_max_gap = worker_stats
+                .ordered_writer_max_gap
+                .max(output_batch.batch_id - next_batch_id);
+            *waiting_for_batch_counts.entry(next_batch_id).or_insert(0) += 1;
         }
+        worker_stats.max_completed_batch_gap_at_writer = worker_stats
+            .max_completed_batch_gap_at_writer
+            .max(output_batch.batch_id.saturating_sub(next_batch_id));
+        pending.insert(output_batch.batch_id, output_batch);
+        flow_controller.on_writer_ordered_pending(output_batch_bytes_estimate);
+        worker_stats.ordered_writer_pending_batches_max = worker_stats
+            .ordered_writer_pending_batches_max
+            .max(pending.len());
+        worker_stats.ordered_writer_pending_map_max_size = worker_stats
+            .ordered_writer_pending_map_max_size
+            .max(pending.len());
         let order_wait_start = Instant::now();
         while let Some(batch) = pending.remove(&next_batch_id) {
             worker_stats.ordered_writer_wait_for_next_batch_seconds +=
@@ -4188,29 +3760,10 @@ fn direct_writer_thread(
             ordered_writer_next_expected_batch_id.store(next_batch_id, Ordering::Relaxed);
         }
         worker_stats.ordered_writer_next_expected_batch_id = next_batch_id;
-        if let Some(total_batches) = done_total_batches {
-            if next_batch_id == total_batches {
-                break;
-            }
-            if !pending.contains_key(&next_batch_id) {
-                bail!(
-                    "ordered writer Done received but batch is missing: next_expected_batch_id={} total_batches={} pending_batches={}",
-                    next_batch_id,
-                    total_batches,
-                    pending.len()
-                );
-            }
-        }
     }
     if !pending.is_empty() {
         bail!("ordered writer terminated with pending out-of-order batches");
     }
-    stage_log_always(format!(
-        "STAGE direct_writer_finished batches={} records={} bytes_estimate={}",
-        worker_stats.batches_processed,
-        worker_stats.records_written,
-        worker_stats.estimated_uncompressed_bytes_written
-    ));
     let mut waiting_for_top: Vec<(u64, u64)> = waiting_for_batch_counts.into_iter().collect();
     waiting_for_top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     worker_stats.ordered_writer_waiting_for_batch_topn = waiting_for_top
@@ -4244,7 +3797,6 @@ fn direct_writer_thread(
     let sync_start = Instant::now();
     worker_stats.file_sync_or_drop_seconds = sync_start.elapsed().as_secs_f64();
     mark_elapsed_once(&lifecycle.writer_finalize_done_micros, pipeline_start);
-    stage_log_always("STAGE direct_writer_flushed");
     worker_stats.bgzf_flush_seconds = 0.0;
     worker_stats.output_finalize_non_tail_seconds = worker_stats.writer_periodic_flush_seconds
         + worker_stats.writer_pre_close_flush_seconds
@@ -4357,22 +3909,12 @@ fn process_direct_batch(batch: DirectInputBatch, quality: u8) -> DirectOutputBat
     }
 }
 
-#[allow(dead_code)]
 fn approx_record_payload_bytes(record: &Record) -> u64 {
     let seq_len = record.seq_len() as u64;
     let qual_len = record.qual().len() as u64;
     let qname_len = record.qname().len() as u64;
     let cigar_ops = record.cigar().len() as u64;
     qname_len + seq_len + qual_len + (cigar_ops * 4)
-}
-
-fn increment_depth(counter: &AtomicUsize) -> usize {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(1))
-        })
-        .map(|previous| previous.saturating_add(1))
-        .unwrap_or_else(|current| current)
 }
 
 fn decrement_depth(counter: &AtomicUsize) {
@@ -4824,7 +4366,6 @@ fn next_group_records_read(
         }
     }
     reader_stats.group_build_seconds += group_build_start.elapsed().as_secs_f64();
-    reader_stats.groups_decoded += 1;
     let decode_elapsed = decode_start.elapsed().as_secs_f64();
     reader_stats.decode_seconds += decode_elapsed;
     reader_stats.decode_only_seconds += decode_elapsed;
@@ -5126,7 +4667,8 @@ fn resolve_split_bgzf_workers(total_bgzf_workers: usize) -> SplitBgzfWorkers {
 
 fn direct_htslib_pool_mode_name(mode: &DirectHtslibPoolMode) -> &'static str {
     match mode {
-        DirectHtslibPoolMode::Shared | DirectHtslibPoolMode::SplitPerHandle => "per_handle_threads",
+        DirectHtslibPoolMode::Shared => "shared",
+        DirectHtslibPoolMode::SplitPerHandle => "split_per_handle",
     }
 }
 
@@ -5190,12 +4732,6 @@ fn stage_log(cli: &Cli, message: String) {
     if cli.log_level >= LogLevel::Info {
         println!("{message}");
     }
-}
-
-fn stage_log_always(message: impl AsRef<str>) {
-    let message = message.as_ref();
-    println!("{message}");
-    eprintln!("{message}");
 }
 
 #[cfg(test)]
@@ -5461,9 +4997,6 @@ mod tests {
                 resolution.shared_pool_intended_writer_bgzf_workers
                     > resolution.shared_pool_intended_per_reader_bgzf_workers
             );
-            assert!(
-                resolution.shared_pool_intended_writer_bgzf_workers > resolution.compute_workers
-            );
         }
     }
 
@@ -5507,14 +5040,12 @@ mod tests {
     #[test]
     fn direct_thread_roles_allocate_proportional_reader_and_writer_workers() {
         let resolution = resolve_direct_thread_roles(96);
-        if resolution.resolved_total_threads >= 6 {
-            assert!(resolution.shared_pool_intended_per_reader_bgzf_workers >= 1);
-            assert!(resolution.shared_pool_intended_writer_bgzf_workers >= 1);
-            assert!(
-                resolution.shared_pool_intended_writer_bgzf_workers
-                    > resolution.shared_pool_intended_per_reader_bgzf_workers
-            );
-        }
+        assert!(resolution.shared_pool_intended_per_reader_bgzf_workers >= 1);
+        assert!(resolution.shared_pool_intended_writer_bgzf_workers >= 1);
+        assert!(
+            resolution.shared_pool_intended_writer_bgzf_workers
+                > resolution.shared_pool_intended_per_reader_bgzf_workers
+        );
         assert!(resolution.compute_workers >= 1);
         assert_eq!(
             resolution.compute_workers + resolution.total_bgzf_workers,
