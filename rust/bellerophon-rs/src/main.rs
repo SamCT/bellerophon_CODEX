@@ -3,6 +3,7 @@ use clap::{Parser, ValueEnum};
 use rust_htslib::bam;
 use rust_htslib::bam::record::{Cigar, Record};
 use rust_htslib::bam::{CompressionLevel, Read, Writer};
+use rust_htslib::tpool::ThreadPool;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
@@ -1104,6 +1105,39 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let forward_bgzf_threads = split_workers.forward;
     let reverse_bgzf_threads = split_workers.reverse;
     let output_bgzf_threads = split_workers.output;
+    // Keep the HTSlib output pool owned by the coordinator until after the writer
+    // joins; the BGZF EOF marker is emitted during writer drop/close.
+    let mut shared_bgzf_pool: Option<ThreadPool> = None;
+    let mut output_bgzf_pool: Option<ThreadPool> = None;
+    let mut output_writer = Writer::from_path(&cli.output, &output_header, bam::Format::Bam)
+        .with_context(|| format!("failed to create output {}", cli.output.display()))?;
+    match cli.direct_htslib_pool_mode {
+        DirectHtslibPoolMode::Shared => {
+            if thread_resolution.htslib_pool_enabled && output_bgzf_threads > 0 {
+                let pool = ThreadPool::new(output_bgzf_threads as u32)
+                    .context("failed to create output BGZF thread pool")?;
+                output_writer
+                    .set_thread_pool(&pool)
+                    .context("failed to attach output BGZF pool to output writer")?;
+                shared_bgzf_pool = Some(pool);
+            }
+        }
+        DirectHtslibPoolMode::SplitPerHandle => {
+            if output_bgzf_threads > 0 {
+                let pool = ThreadPool::new(output_bgzf_threads as u32)
+                    .context("failed to create output BGZF thread pool")?;
+                output_writer
+                    .set_thread_pool(&pool)
+                    .context("failed to attach output BGZF pool to output writer")?;
+                output_bgzf_pool = Some(pool);
+            }
+        }
+    }
+    if let Some(level) = cli.compression_level {
+        output_writer
+            .set_compression_level(compression_level_from_u8(level))
+            .with_context(|| format!("failed to set output compression level {level}"))?;
+    }
     let (input_batch_sender, input_batch_receiver) =
         sync_channel::<DirectInputBatch>(queue_policy.output_queue_capacity);
     let (output_batch_sender, output_batch_receiver) =
@@ -1196,15 +1230,11 @@ fn run_direct(cli: &Cli) -> Result<()> {
     let writer_lifecycle = Arc::clone(&lifecycle);
     let writer_alive_for_thread = Arc::clone(&writer_alive);
     let output_path_for_writer = cli.output.clone();
-    let output_header_for_writer = output_header;
-    let output_compression_level = cli.compression_level;
     let writer_handle = thread::spawn(move || {
         let result = direct_writer_thread(
             output_batch_receiver,
+            output_writer,
             output_path_for_writer,
-            output_header_for_writer,
-            output_bgzf_threads,
-            output_compression_level,
             writer_output_queue_received,
             writer_output_bytes_submitted,
             writer_output_bytes_written,
@@ -1708,8 +1738,12 @@ fn run_direct(cli: &Cli) -> Result<()> {
         ),
     );
     writer_drain_diagnostics.join_wait_seconds = writer_drain_seconds;
-    let shared_pool_drop_seconds = 0.0;
-    let output_pool_drop_seconds = 0.0;
+    let output_pool_drop_start = Instant::now();
+    drop(output_bgzf_pool);
+    let output_pool_drop_seconds = output_pool_drop_start.elapsed().as_secs_f64();
+    let shared_pool_drop_start = Instant::now();
+    drop(shared_bgzf_pool);
+    let shared_pool_drop_seconds = shared_pool_drop_start.elapsed().as_secs_f64();
     stage_log(
         cli,
         format!(
@@ -3909,10 +3943,8 @@ fn spawn_direct_stall_watchdog(
 
 fn direct_writer_thread(
     batch_receiver: Receiver<WriterMessage>,
+    mut output: Writer,
     output_path: PathBuf,
-    output_header: bam::Header,
-    output_bgzf_threads: usize,
-    compression_level: Option<u8>,
     output_queue_received: Arc<AtomicU64>,
     output_bytes_submitted: Arc<AtomicU64>,
     output_bytes_written: Arc<AtomicU64>,
@@ -3926,18 +3958,6 @@ fn direct_writer_thread(
 ) -> Result<DirectWorkerStats> {
     mark_elapsed_once(&lifecycle.writer_thread_started_micros, pipeline_start);
     let writer_loop_start = Instant::now();
-    let mut output = Writer::from_path(&output_path, &output_header, bam::Format::Bam)
-        .with_context(|| format!("failed to create output {}", output_path.display()))?;
-    if output_bgzf_threads > 0 {
-        output
-            .set_threads(output_bgzf_threads)
-            .context("failed to set output BGZF writer threads")?;
-    }
-    if let Some(level) = compression_level {
-        output
-            .set_compression_level(compression_level_from_u8(level))
-            .with_context(|| format!("failed to set output compression level {level}"))?;
-    }
     stage_log_always("STAGE direct_writer_started");
     writer_last_progress_micros.store(0, Ordering::Relaxed);
     let mut worker_stats = DirectWorkerStats::default();
