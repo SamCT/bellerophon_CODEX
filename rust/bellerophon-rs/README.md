@@ -37,3 +37,31 @@ use `pixi run` for production jobs.
 cargo fmt --manifest-path rust/bellerophon-rs/Cargo.toml
 cargo test --manifest-path rust/bellerophon-rs/Cargo.toml
 ```
+
+## Direct pipeline debugging
+
+To isolate parallel reader/synchronizer EOF issues, run the direct pipeline with
+the serial reader:
+
+```bash
+bellerophon-rs \
+  --forward R1.bam \
+  --reverse R2.bam \
+  --threads 16 \
+  --quality 0 \
+  --direct-reader-mode serial \
+  --output out.serial.bam
+```
+
+For shutdown diagnostics, add a stall warning timeout:
+
+```bash
+bellerophon-rs \
+  --forward R1.bam \
+  --reverse R2.bam \
+  --threads 16 \
+  --quality 0 \
+  --stall-timeout-seconds 60 \
+  --abort-on-stall \
+  --output out.debug.bam
+```
